@@ -1,0 +1,1362 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Agromel S.R.L. — Sistema de Vacaciones</title>
+<style>
+  @page{size:letter;margin:0.4in;}
+  @media print{.print-hidden{display:none!important}body{background:white}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+  body{margin:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+<!-- Firebase SDK clasico (compat) - sin "import", evita conflicto con el compilador de React -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
+<script>
+// ============================================================
+// CONFIGURACION DE FIREBASE
+// ============================================================
+const firebaseConfig = {
+  apiKey: "AIzaSyAzY-X7NjJwE8AqNUIjk4H7nni_H8VZmtI",
+  authDomain: "agromel-vacaciones.firebaseapp.com",
+  projectId: "agromel-vacaciones",
+  storageBucket: "agromel-vacaciones.firebasestorage.app",
+  messagingSenderId: "80407789812",
+  appId: "1:80407789812:web:57c17d574ab728a33f1ea1"
+};
+firebase.initializeApp(firebaseConfig);
+window.__fbAuth = firebase.auth();
+window.__fbDb = firebase.firestore();
+</script>
+
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useMemo } = React;
+
+// ============================================================
+// CONSTANTES
+// ============================================================
+const COMPANY_FULL = "EMPRESA AGROPECUARIA AGROMEL S.R.L.";
+const COMPANY_SHORT = "AGROMEL S.R.L.";
+const AREAS = ["ADMINISTRACION","VENTAS","ALMACEN","LOGISTICA","PRODUCCION","CONTABILIDAD","TECNICO","GERENCIA","COMEX","COMERCIAL","COBRANZAS","FINANZAS","CALIDAD","FACTURACION Y DESPACHO","SEGURIDAD","RRHH","CAMPO","OTRO"];
+const SUCURSALES = ["SCZ (OF. CENTRAL)","SCZ (PILAT)","CBBA","SIV","La Paz","El Alto","Otro"];
+const MODALIDADES = [
+  {value:"DIA_COMPLETO",label:"Día completo"},
+  {value:"MEDIA_MANANA",label:"Media mañana"},
+  {value:"MEDIA_TARDE", label:"Media tarde"},
+  {value:"HORA",        label:"Por horas"},
+];
+const TIPO_CFG = {
+  VACACION:     {icon:"🏖️",label:"Vacaciones",   sub:"Descuenta saldo",   color:COLOR_RED},
+  COMPENSACION: {icon:"🔄",label:"Compensación", sub:"No descuenta saldo",color:"#b45309"},
+};
+const EC = {
+  Pendiente:{bg:"#fef9c3",text:"#854d0e",border:"#fde68a"},
+  Aprobada: {bg:"#f0fdf4",text:"#166534",border:"#bbf7d0"},
+  Rechazada:{bg:"#fef2f2",text:"#991b1b",border:"#fecaca"},
+};
+const FERIADOS_FIJOS = [
+  {md:"01-01",desc:"Año Nuevo"},
+  {md:"05-01",desc:"Día del Trabajo"},
+  {md:"06-21",desc:"Año Nuevo Andino"},
+  {md:"08-06",desc:"Independencia de Bolivia"},
+  {md:"09-24",desc:"Día del Dpto. Santa Cruz"},
+  {md:"11-02",desc:"Día de los Difuntos"},
+  {md:"12-25",desc:"Navidad"},
+];
+
+// ============================================================
+// UTILIDADES
+// ============================================================
+const genNum = () => {
+  const n=new Date();
+  return `${n.getFullYear()}${String(n.getMonth()+1).padStart(2,"0")}${String(n.getDate()).padStart(2,"0")}-${Date.now().toString().slice(-4)}`;
+};
+const fmtD  = d => d?new Date(d+"T12:00:00").toLocaleDateString("es-BO",{day:"2-digit",month:"2-digit",year:"numeric"}):"";
+const fmtDL = d => d?new Date(d+"T12:00:00").toLocaleDateString("es-BO",{day:"numeric",month:"long",year:"numeric"}):"";
+const fmtMd = (m,h) => ({DIA_COMPLETO:"Día completo",MEDIA_MANANA:"Media mañana",MEDIA_TARDE:"Media tarde",HORA:`Por horas (${h} h/día)`}[m]||m);
+const hoyISO = () => new Date().toISOString().split("T")[0];
+
+function splitNombre(nombreCompleto) {
+  const parts = (nombreCompleto||"").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return {primerApellido:"", segundoApellido:"", nombres:""};
+  if (parts.length === 1) return {primerApellido:parts[0], segundoApellido:"", nombres:""};
+  if (parts.length === 2) return {primerApellido:parts[0], segundoApellido:parts[1], nombres:""};
+  const apellidos = parts.slice(-2);
+  const nombres = parts.slice(0,-2).join(" ");
+  return {primerApellido:apellidos[0], segundoApellido:apellidos[1], nombres};
+}
+
+function getFeriadoDesc(dateStr, feriadosVar=[]) {
+  const md=dateStr.slice(5);
+  const fijo=FERIADOS_FIJOS.find(f=>f.md===md);
+  if(fijo) return fijo.desc;
+  const variable=feriadosVar.find(f=>f.fecha===dateStr);
+  return variable?variable.desc:null;
+}
+
+function calcDias(ini, fin, mod, hpd, feriadosVar=[], fechaNac=null, horarioSemana="L-V") {
+  if(!ini||!fin) return {dias:0,feriadosEnRango:[],cumpleEnRango:null};
+  let count=0;
+  const feriadosEnRango=[];
+  let cumpleEnRango=null;
+  let cur=new Date(ini+"T12:00:00");
+  const end=new Date(fin+"T12:00:00");
+  const cumpleMD=fechaNac?fechaNac.slice(5):null;
+  // L-V: no laboran sabado(6) ni domingo(0). L-S: solo domingo(0) no es laborable.
+  const noLaborable=dow=>horarioSemana==="L-S"?dow===0:(dow===0||dow===6);
+  while(cur<=end){
+    const dow=cur.getDay();
+    const ds=cur.toISOString().split("T")[0];
+    const curMD=ds.slice(5);
+    cur.setDate(cur.getDate()+1);
+    if(noLaborable(dow)) continue;
+    const ferDesc=getFeriadoDesc(ds,feriadosVar);
+    if(ferDesc){feriadosEnRango.push({fecha:ds,desc:ferDesc});continue;}
+    if(cumpleMD&&curMD===cumpleMD){cumpleEnRango=ds;count+=0.5;continue;}
+    count++;
+  }
+  let dias=count;
+  if(mod==="MEDIA_MANANA"||mod==="MEDIA_TARDE") dias=count*0.5;
+  if(mod==="HORA") dias=Math.round((parseFloat(hpd)||0)*count/8*100)/100;
+  return{dias,feriadosEnRango,cumpleEnRango};
+}
+
+function diasPorAnioCumplido(anioNum){
+  if(anioNum<=5) return 15;
+  if(anioNum<=10) return 20;
+  return 30;
+}
+function calcDiasAcumulados(fechaIngreso, fechaRef){
+  if(!fechaIngreso) return null;
+  const ini=new Date(fechaIngreso+"T00:00:00");
+  const ref=fechaRef?new Date(fechaRef+"T00:00:00"):new Date();
+  if(isNaN(ini.getTime())||ref<=ini) return 0;
+  let total=0, anioNum=1, cursor=new Date(ini);
+  while(true){
+    const finAnio=new Date(cursor); finAnio.setFullYear(finAnio.getFullYear()+1);
+    if(finAnio<=ref){
+      // Solo se acredita el bloque completo de dias al cumplirse el anio; nada se prorratea mientras tanto.
+      total+=diasPorAnioCumplido(anioNum);
+      cursor=finAnio; anioNum++;
+    } else {
+      break;
+    }
+  }
+  return total;
+}
+function calcAntiguedadTxt(fechaIngreso, fechaRef){
+  if(!fechaIngreso) return "";
+  const ini=new Date(fechaIngreso+"T00:00:00");
+  const ref=fechaRef?new Date(fechaRef+"T00:00:00"):new Date();
+  if(isNaN(ini.getTime())||ref<=ini) return "menos de 1 mes";
+  let years=ref.getFullYear()-ini.getFullYear();
+  let months=ref.getMonth()-ini.getMonth();
+  if(ref.getDate()<ini.getDate()) months--;
+  if(months<0){years--;months+=12;}
+  const p=[];
+  if(years>0) p.push(`${years} año${years!==1?"s":""}`);
+  if(months>0) p.push(`${months} mes${months!==1?"es":""}`);
+  return p.length?p.join(", "):"menos de 1 mes";
+}
+function calcSaldoActual(emp, sols, fechaRef){
+  if(!emp) return 0;
+  const ref=fechaRef||hoyISO();
+  const corte=emp.fechaCorteSaldo||ref;
+  const base=parseFloat(emp.diasDisponibles)||0;
+  const acumuladoDesdeCorte=emp.fechaIngreso
+    ? (calcDiasAcumulados(emp.fechaIngreso,ref)-calcDiasAcumulados(emp.fechaIngreso,corte))
+    : 0;
+  const usadoDesdeCorte=(sols||[])
+    .filter(s=>s.ci&&emp.ci&&s.ci===emp.ci&&s.estado==="Aprobada"&&s.tipo!=="COMPENSACION"&&s.fechaInicio&&s.fechaInicio>=corte)
+    .reduce((sum,s)=>sum+(parseFloat(s.diasEstimados)||0),0);
+  return Math.round((base+acumuladoDesdeCorte-usadoDesdeCorte)*10)/10;
+}
+
+// ============================================================
+// CAPA DE DATOS (Firestore)
+// ============================================================
+const DB = {
+  async empGetAll(){
+    const snap=await window.__fbDb.collection("empleados").get();
+    return snap.docs.map(d=>({id:d.id,...d.data()}));
+  },
+  async empGetByCi(ci){
+    const snap=await window.__fbDb.collection("empleados").where("ci","==",ci).get();
+    if(snap.empty) return null;
+    const d=snap.docs[0]; return {id:d.id,...d.data()};
+  },
+  async empGetByUid(uid){
+    const snap=await window.__fbDb.collection("empleados").where("uid","==",uid).get();
+    if(snap.empty) return null;
+    const d=snap.docs[0]; return {id:d.id,...d.data()};
+  },
+  async empSave(emp){
+    if(emp.id){ const {id,...rest}=emp; await window.__fbDb.collection("empleados").doc(id).set(rest,{merge:true}); return id; }
+    const ref=await window.__fbDb.collection("empleados").add(emp); return ref.id;
+  },
+  async empDelete(id){
+    await window.__fbDb.collection("empleados").doc(id).delete();
+  },
+  async solGetAll(){
+    const snap=await window.__fbDb.collection("solicitudes").get();
+    return snap.docs.map(d=>({id:d.id,...d.data()}));
+  },
+  async solCreate(sol){
+    const ref=await window.__fbDb.collection("solicitudes").add(sol); return ref.id;
+  },
+  async solUpdate(id,data){
+    await window.__fbDb.collection("solicitudes").doc(id).update(data);
+  },
+  async solDelete(id){
+    await window.__fbDb.collection("solicitudes").doc(id).delete();
+  },
+  async ferGet(year){
+    const snap=await window.__fbDb.collection("feriados").doc(String(year)).get();
+    return snap.exists?(snap.data().items||[]):[];
+  },
+  async ferSet(year,items){
+    await window.__fbDb.collection("feriados").doc(String(year)).set({items});
+  },
+  // Indice publico (lectura sin sesion) que mapea CI -> email real de Firebase Auth,
+  // necesario porque el login se hace con CI pero Firebase Auth exige un email internamente.
+  async loginIndexGet(ci){
+    const snap=await window.__fbDb.collection("login_index").doc(ci).get();
+    return snap.exists?snap.data().email:null;
+  },
+  async loginIndexSet(ci,email){
+    await window.__fbDb.collection("login_index").doc(ci).set({email});
+  },
+  // Espejo minimo uid -> rol, usado por las reglas de seguridad de Firestore para verificar quien es RRHH
+  // sin exponer el resto de los datos del empleado. Se actualiza cada vez que se guarda un empleado con uid.
+  async roleSet(uid,esRRHH){
+    if(!uid) return;
+    await window.__fbDb.collection("roles").doc(uid).set({esRRHH:!!esRRHH});
+  },
+};
+
+// ============================================================
+// ESTILOS COMUNES (paleta acorde al logo: negro + rojo)
+// ============================================================
+const COLOR_DARK="#1a1a1a";
+const COLOR_RED="#c0392b";
+const INP={width:"100%",border:"1.5px solid #d1d5db",borderRadius:"8px",padding:"9px 12px",fontSize:"14px",outline:"none",boxSizing:"border-box",fontFamily:"inherit"};
+const LBL={display:"block",fontSize:"13px",fontWeight:"600",color:"#374151",marginBottom:"5px"};
+const BTN_PRIMARY={backgroundColor:COLOR_RED,color:"white",padding:"11px 18px",borderRadius:"8px",border:"none",fontWeight:"700",fontSize:"14px",cursor:"pointer"};
+const BTN_SECONDARY={backgroundColor:"#f3f4f6",color:"#374151",padding:"11px 18px",borderRadius:"8px",border:"1.5px solid #e5e7eb",fontWeight:"600",fontSize:"14px",cursor:"pointer"};
+const CARD={backgroundColor:"white",borderRadius:"12px",boxShadow:"0 1px 3px rgba(0,0,0,0.1)",border:"1px solid #e5e7eb",overflow:"hidden"};
+
+function PasswordField({label,value,onChange,placeholder}){
+  const [ver,setVer]=useState(false);
+  return(
+    <div>
+      {label&&<label style={LBL}>{label}</label>}
+      <div style={{position:"relative"}}>
+        <input type={ver?"text":"password"} style={{...INP,paddingRight:"44px"}} value={value} onChange={onChange} placeholder={placeholder}/>
+        <button type="button" onClick={()=>setVer(v=>!v)} style={{position:"absolute",right:"6px",top:"50%",transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",fontSize:"16px",padding:"4px 6px",color:"#6b7280"}} title={ver?"Ocultar contraseña":"Ver contraseña"}>
+          {ver?"🙈":"👁️"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// FORMULARIO IMPRIMIBLE
+// ============================================================
+const LOGO_AGROMEL_B64="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";
+
+function PrintForm({s}) {
+  const esC=s.tipo==="COMPENSACION";
+  const {primerApellido,segundoApellido,nombres}=splitNombre(s.nombreEmpleado);
+  const diasDisp=(s.diasDisponibles!==undefined&&s.diasDisponibles!==null&&s.diasDisponibles!=="")?parseFloat(s.diasDisponibles):null;
+  const diasPendientes=diasDisp!==null?(diasDisp-(s.diasEstimados||0)):null;
+  const fmtNum=n=>(n===null||n===undefined||isNaN(n))?"":n.toLocaleString("es-BO",{minimumFractionDigits:0,maximumFractionDigits:2});
+  const gray="#d9d9d9", yellow="#ffff99", border="1px solid #000", F="Arial,sans-serif";
+  const sh={backgroundColor:gray,border,borderBottom:"none",padding:"6px 12px",fontSize:"13px",fontWeight:"bold",fontFamily:F};
+  const th2={border,backgroundColor:yellow,padding:"8px 10px",fontSize:"13px",fontWeight:"bold",textAlign:"center",fontFamily:F};
+  const td2={border,padding:"10px 10px",fontSize:"13px",textAlign:"center",fontFamily:F};
+  return(
+    <div style={{fontFamily:F,maxWidth:"7.5in",margin:"0 auto",padding:"0.2in",backgroundColor:"white",color:"#111"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"8px"}}>
+        <div>
+          <img src={`data:image/png;base64,${LOGO_AGROMEL_B64}`} alt="Agromel S.R.L." style={{height:"70px",display:"block"}}/>
+        </div>
+        <div style={{fontSize:"13px",display:"flex",alignItems:"center",gap:"6px"}}>
+          <span style={{fontWeight:"bold"}}>Código</span>
+          <span style={{border,padding:"4px 14px",display:"inline-block",minWidth:"60px",textAlign:"center"}}>{s.codigo||""}</span>
+        </div>
+      </div>
+      <div style={{textAlign:"center",marginBottom:"16px"}}>
+        <div style={{fontSize:"19px",fontWeight:"bold",textDecoration:"underline"}}>FORMULARIO DE {esC?"COMPENSACIÓN":"VACACIONES"}</div>
+      </div>
+      <div style={sh}>DATOS PERSONALES Y ADMINISTRATIVOS:</div>
+      <table style={{width:"100%",borderCollapse:"collapse",marginBottom:"12px"}}><tbody>
+        <tr><td style={th2}>Primer Apellido</td><td style={th2}>Segundo Apellido</td><td style={th2}>Nombres</td></tr>
+        <tr><td style={td2}>{primerApellido}</td><td style={td2}>{segundoApellido}</td><td style={td2}>{nombres}</td></tr>
+        <tr><td style={th2}>Cargo</td><td style={th2}>Sucursal</td><td style={th2}>Fecha de Ingreso</td></tr>
+        <tr><td style={td2}>{s.cargo}</td><td style={td2}>{s.sucursal||""}</td><td style={td2}>{s.fechaIngreso?fmtD(s.fechaIngreso):""}</td></tr>
+      </tbody></table>
+      <div style={{display:"flex",alignItems:"stretch"}}>
+        <div style={{flex:1,...sh,display:"flex",alignItems:"center"}}>SOLICITUD DE {esC?"COMPENSACIÓN":"VACACIONES"}:</div>
+        <div style={{border,borderLeft:"none",padding:"6px 12px",fontSize:"12px",backgroundColor:"#f2f2f2",display:"flex",alignItems:"center",gap:"8px",whiteSpace:"nowrap"}}>
+          <span style={{fontWeight:"bold"}}>Dias Disponibles</span>
+          <span style={{border,backgroundColor:"white",padding:"3px 12px",fontWeight:"bold"}}>{diasDisp!==null?fmtNum(diasDisp):""}</span>
+        </div>
+      </div>
+      <table style={{width:"100%",borderCollapse:"collapse",marginBottom:"12px"}}><tbody>
+        <tr>
+          <td style={th2}>Periodo</td><td style={th2}>Fecha de Inicio</td><td style={th2}>Fecha de Término</td>
+          <td style={th2}>Total Dias Laborales</td><td style={th2}>Fecha de Retorno</td><td style={th2}>Días Pendientes</td>
+        </tr>
+        <tr>
+          <td style={td2}>{s.fechaInicio?s.fechaInicio.slice(0,4):""}</td>
+          <td style={td2}>{fmtD(s.fechaInicio)}</td>
+          <td style={td2}>{fmtD(s.fechaFin)}</td>
+          <td style={td2}>{s.diasEstimados}</td>
+          <td style={td2}>{s.fechaRetorno?fmtD(s.fechaRetorno):""}</td>
+          <td style={td2}>{diasPendientes!==null?fmtNum(diasPendientes):""}</td>
+        </tr>
+        <tr><td style={td2}>&nbsp;</td><td style={td2}></td><td style={td2}></td><td style={td2}></td><td style={td2}></td><td style={td2}></td></tr>
+        <tr>
+          <td colSpan={3} style={{...th2,textAlign:"center"}}>TOTAL</td>
+          <td style={td2}>{s.diasEstimados}</td><td style={td2}></td><td style={td2}></td>
+        </tr>
+      </tbody></table>
+      <div style={sh}>ACLARACIONES:</div>
+      <div style={{border,borderTop:"none",minHeight:"60px",padding:"10px 12px",fontSize:"13px",marginBottom:"18px",fontFamily:F}}>
+        {[
+          s.feriadosEnRango?.length>0&&`Feriados excluidos: ${s.feriadosEnRango.map(f=>`${fmtD(f.fecha)} – ${f.desc}`).join(", ")}.`,
+          s.cumpleEnRango&&`Cumpleaños en período: ${fmtD(s.cumpleEnRango)} (½ día libre, no descuenta saldo).`,
+          esC&&"Compensación por trabajo extraordinario. No afecta el saldo de vacaciones.",
+          s.observaciones,
+        ].filter(Boolean).join(" ")}
+      </div>
+      <table style={{width:"100%",borderCollapse:"collapse"}}><tbody>
+        <tr><td style={{...th2,width:"50%"}}>FIRMA DEL INTERESADO</td><td style={{...th2,width:"50%"}}>AUTORIZACIÓN PERMISO</td></tr>
+        <tr>
+          <td style={{border,height:"230px",verticalAlign:"bottom",padding:"6px 12px",fontFamily:F}}>
+            <div style={{fontSize:"11px",color:"#555"}}>FECHA DE SOLICITUD: {fmtD(s.fechaSolicitud?.split("T")[0])}</div>
+          </td>
+          <td style={{border,verticalAlign:"top",padding:"0"}}>
+            <div style={{backgroundColor:gray,fontSize:"12px",fontWeight:"bold",padding:"4px 12px",borderBottom:"1px solid #000",fontFamily:F}}>
+              JEFE INMEDIATO SUPERIOR{s.jefeNombre?` — ${s.jefeNombre.toUpperCase()}`:""}
+            </div>
+            <div style={{height:"210px"}}/>
+          </td>
+        </tr>
+      </tbody></table>
+      <div style={{marginTop:"18px",fontSize:"10px",color:"#333",fontFamily:F}}>Departamento de RRHH</div>
+    </div>
+  );
+}
+
+// ============================================================
+// PANTALLA DE LOGIN / REGISTRO
+// ============================================================
+function ciToEmail(ci){
+  const clean=(ci||"").trim().replace(/[^a-zA-Z0-9]/g,"").toLowerCase();
+  return `ci${clean}@agromel-vacaciones.local`;
+}
+function esEmailReal(email){
+  return !!email && !email.endsWith("@agromel-vacaciones.local");
+}
+async function resolverEmailPorCi(ci){
+  const desdeIndice=await DB.loginIndexGet(ci.trim());
+  return desdeIndice || ciToEmail(ci); // compatibilidad con cuentas creadas antes de tener el indice
+}
+
+function AuthScreen(){
+  const [modo,setModo]=useState("login"); // login | registro | reset
+  const [ci,setCi]=useState("");
+  const [password,setPassword]=useState("");
+  const [correoOpcional,setCorreoOpcional]=useState("");
+  const [error,setError]=useState("");
+  const [msg,setMsg]=useState("");
+  const [loading,setLoading]=useState(false);
+
+  const doLogin=async()=>{
+    setError(""); setLoading(true);
+    try{
+      if(!ci.trim()){ setError("Ingresa tu número de CI."); setLoading(false); return; }
+      const email=await resolverEmailPorCi(ci);
+      await window.__fbAuth.signInWithEmailAndPassword(email,password);
+    }catch(e){ setError("No se pudo iniciar sesión. Revisa tu CI y contraseña."); }
+    setLoading(false);
+  };
+
+  const doRegistro=async()=>{
+    setError(""); setLoading(true);
+    let cred=null;
+    try{
+      if(!ci.trim()){ setError("Ingresa tu número de CI."); setLoading(false); return; }
+      if(!password||password.length<6){ setError("La contraseña debe tener al menos 6 caracteres."); setLoading(false); return; }
+      const authEmail=correoOpcional.trim()||ciToEmail(ci);
+      // Paso 1: crear la cuenta primero (recien ahi quedamos autenticados y podemos leer la base de datos)
+      cred=await window.__fbAuth.createUserWithEmailAndPassword(authEmail,password);
+      await DB.loginIndexSet(ci.trim(),authEmail);
+
+      // Paso 2: ya autenticados, revisamos si es la primera cuenta del sistema (bootstrap RRHH) o un empleado ya cargado
+      const todos=await DB.empGetAll();
+      if(todos.length===0){
+        await DB.empSave({ci:ci.trim(),nombre:"",cargo:"",area:AREAS[0],sucursal:SUCURSALES[0],fechaIngreso:"",
+          codigo:"",diasDisponibles:"0",fechaCorteSaldo:hoyISO(),fechaNacimiento:"",jefeCi:"",esRRHH:true,
+          uid:cred.user.uid,email:authEmail});
+        setMsg("¡Cuenta creada! Eres la primera persona registrada, así que tienes acceso al Panel RRHH.");
+        setLoading(false); return;
+      }
+      const empExistente=await DB.empGetByCi(ci.trim());
+      if(!empExistente){
+        await cred.user.delete().catch(()=>{});
+        setError("Tu CI no está registrado en el sistema. Pide a RRHH que te agregue primero.");
+        setLoading(false); return;
+      }
+      if(empExistente.uid){
+        await cred.user.delete().catch(()=>{});
+        setError("Ese CI ya tiene una cuenta creada. Si registraste un correo, usa 'Olvidé mi contraseña'; si no, pide a RRHH que la restablezca.");
+        setLoading(false); return;
+      }
+      await DB.empSave({id:empExistente.id,uid:cred.user.uid,email:authEmail});
+      setMsg("¡Cuenta creada correctamente!");
+    }catch(e){
+      if(cred) await cred.user.delete().catch(()=>{});
+      setError(e.code==="auth/email-already-in-use"?"Ya existe una cuenta con ese CI o correo. Intenta iniciar sesión.":
+        e.code==="auth/weak-password"?"La contraseña es muy débil, usa al menos 6 caracteres.":
+        e.code==="auth/invalid-email"?"El correo ingresado no es válido.":
+        "No se pudo crear la cuenta. Intenta de nuevo.");
+    }
+    setLoading(false);
+  };
+
+  const doReset=async()=>{
+    setError(""); setMsg(""); setLoading(true);
+    try{
+      if(!ci.trim()){ setError("Ingresa tu número de CI."); setLoading(false); return; }
+      const email=await resolverEmailPorCi(ci);
+      if(!esEmailReal(email)){
+        setError("No registraste un correo real con esa cuenta. Pide a RRHH que te restablezca la contraseña.");
+        setLoading(false); return;
+      }
+      await window.__fbAuth.sendPasswordResetEmail(email);
+      setMsg("Te enviamos un correo para restablecer tu contraseña.");
+    }catch(e){ setError("No se pudo enviar el correo. Verifica tu CI."); }
+    setLoading(false);
+  };
+
+  return(
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",padding:"16px"}}>
+      <div style={{...CARD,maxWidth:"380px",width:"100%",padding:"32px"}}>
+        <div style={{textAlign:"center",marginBottom:"20px"}}>
+          <div style={{fontSize:"32px"}}>🏖️</div>
+          <h2 style={{margin:"8px 0 2px",fontSize:"18px",fontWeight:"700",color:"#111827"}}>{COMPANY_SHORT}</h2>
+          <p style={{margin:0,fontSize:"13px",color:"#9ca3af"}}>Sistema de Vacaciones</p>
+        </div>
+        {msg&&<div style={{padding:"10px 14px",backgroundColor:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:"8px",color:"#166534",fontSize:"13px",marginBottom:"12px"}}>{msg}</div>}
+        {error&&<div style={{padding:"10px 14px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",color:"#dc2626",fontSize:"13px",marginBottom:"12px"}}>⚠️ {error}</div>}
+        <div style={{display:"flex",flexDirection:"column",gap:"10px"}}>
+          <div><label style={LBL}>N° de Cédula de Identidad</label><input style={INP} value={ci} onChange={e=>setCi(e.target.value)} placeholder="Tu CI, sin espacios"/></div>
+          {modo!=="reset"&&<PasswordField label="Contraseña" value={password} onChange={e=>setPassword(e.target.value)} placeholder="Mínimo 6 caracteres"/>}
+          {modo==="registro"&&<div><label style={LBL}>Correo electrónico <span style={{color:"#9ca3af",fontWeight:"400"}}>(opcional, solo para recuperar tu contraseña)</span></label><input style={INP} type="email" value={correoOpcional} onChange={e=>setCorreoOpcional(e.target.value)} placeholder="Déjalo vacío si no tienes correo"/></div>}
+          {modo==="login"&&<button disabled={loading} onClick={doLogin} style={{...BTN_PRIMARY,width:"100%"}}>{loading?"Ingresando...":"Iniciar sesión"}</button>}
+          {modo==="registro"&&<button disabled={loading} onClick={doRegistro} style={{...BTN_PRIMARY,width:"100%"}}>{loading?"Creando cuenta...":"Crear cuenta"}</button>}
+          {modo==="reset"&&<button disabled={loading} onClick={doReset} style={{...BTN_PRIMARY,width:"100%"}}>{loading?"Enviando...":"Enviar enlace de recuperación"}</button>}
+        </div>
+        <div style={{marginTop:"16px",display:"flex",justifyContent:"space-between",fontSize:"12px"}}>
+          {modo!=="login"&&<button onClick={()=>{setModo("login");setError("");setMsg("");}} style={{background:"none",border:"none",color:COLOR_RED,cursor:"pointer",fontSize:"12px"}}>← Iniciar sesión</button>}
+          {modo==="login"&&<button onClick={()=>{setModo("registro");setError("");setMsg("");}} style={{background:"none",border:"none",color:COLOR_RED,cursor:"pointer",fontSize:"12px"}}>Crear cuenta nueva</button>}
+          {modo==="login"&&<button onClick={()=>{setModo("reset");setError("");setMsg("");}} style={{background:"none",border:"none",color:"#6b7280",cursor:"pointer",fontSize:"12px"}}>Olvidé mi contraseña</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// VISTA: SOLICITAR VACACIONES (cualquier usuario, incluso jefes)
+// ============================================================
+function SolicitarView({miEmpleado, sols, recargar}){
+  const [step,setStep]=useState("form");
+  const [solGuardada,setSolGuardada]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const [error,setError]=useState("");
+  const [feriadosVar,setFeriadosVar]=useState([]);
+  const [form,setForm]=useState({
+    tipo:"VACACION",modalidad:"DIA_COMPLETO",horasPorDia:"1",
+    fechaInicio:"",fechaFin:"",fechaRetorno:"",observaciones:""
+  });
+  const set=(k,v)=>setForm(p=>({...p,[k]:v}));
+
+  useEffect(()=>{
+    const yr=new Date().getFullYear();
+    Promise.all([DB.ferGet(yr),DB.ferGet(yr+1)]).then(([a,b])=>setFeriadosVar([...a,...b]));
+  },[]);
+
+  const calcResult=useMemo(()=>calcDias(form.fechaInicio,form.fechaFin,form.modalidad,form.horasPorDia,feriadosVar,miEmpleado.fechaNacimiento||null,miEmpleado.horarioSemana||"L-V"),
+    [form.fechaInicio,form.fechaFin,form.modalidad,form.horasPorDia,feriadosVar,miEmpleado.fechaNacimiento,miEmpleado.horarioSemana]);
+
+  const saldoActual=useMemo(()=>calcSaldoActual(miEmpleado,sols),[miEmpleado,sols]);
+
+  const validar=()=>{
+    if(!form.fechaInicio) return "Selecciona la fecha de inicio.";
+    if(!form.fechaFin) return "Selecciona la fecha de fin.";
+    if(form.fechaFin<form.fechaInicio) return "La fecha fin no puede ser menor a la fecha inicio.";
+    if(form.modalidad==="HORA"&&!(parseFloat(form.horasPorDia)>0)) return "Ingresa las horas por día.";
+    return "";
+  };
+
+  const generar=async()=>{
+    const err=validar(); if(err){setError(err);return;}
+    setError(""); setSaving(true);
+    try{
+      const jefe=miEmpleado.jefeCi?await DB.empGetByCi(miEmpleado.jefeCi):null;
+      const nueva={
+        numero:genNum(), empleadoCi:miEmpleado.ci, nombreEmpleado:miEmpleado.nombre, ci:miEmpleado.ci,
+        cargo:miEmpleado.cargo, area:miEmpleado.area, sucursal:miEmpleado.sucursal||"", fechaIngreso:miEmpleado.fechaIngreso||"",
+        codigo:miEmpleado.codigo||"", diasDisponibles:String(saldoActual),
+        tipo:form.tipo, modalidad:form.modalidad, horasPorDia:form.horasPorDia,
+        fechaInicio:form.fechaInicio, fechaFin:form.fechaFin, fechaRetorno:form.fechaRetorno,
+        observaciones:form.observaciones, diasEstimados:calcResult.dias,
+        feriadosEnRango:calcResult.feriadosEnRango, cumpleEnRango:calcResult.cumpleEnRango,
+        estado:"Pendiente", jefeCi:miEmpleado.jefeCi||"", jefeNombre:jefe?jefe.nombre:"",
+        fechaSolicitud:new Date().toISOString(),
+      };
+      const id=await DB.solCreate(nueva);
+      setSolGuardada({...nueva,id}); setStep("preview");
+      recargar();
+    }catch(e){ setError("No se pudo guardar la solicitud. Intenta de nuevo."); }
+    setSaving(false);
+  };
+
+  if(step==="preview"&&solGuardada) return(
+    <div>
+      <div className="print-hidden" style={{display:"flex",gap:"10px",marginBottom:"14px",flexWrap:"wrap"}}>
+        <button onClick={()=>window.print()} style={BTN_PRIMARY}>🖨️ Imprimir formulario</button>
+        <button onClick={()=>{setStep("form");setSolGuardada(null);setForm({tipo:"VACACION",modalidad:"DIA_COMPLETO",horasPorDia:"1",fechaInicio:"",fechaFin:"",fechaRetorno:"",observaciones:""});}} style={BTN_SECONDARY}>Nueva solicitud</button>
+      </div>
+      <div className="print-hidden" style={{marginBottom:"12px",padding:"10px 14px",backgroundColor:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:"8px",color:"#166534",fontSize:"13px"}}>
+        ✅ Solicitud enviada{solGuardada.jefeNombre?` a ${solGuardada.jefeNombre} para su aprobación`:""}. Imprime el formulario y entrégalo firmado a RRHH.
+      </div>
+      <PrintForm s={solGuardada}/>
+    </div>
+  );
+
+  const {dias:diasCalc,feriadosEnRango:fers,cumpleEnRango:cumple}=calcResult;
+  return(
+    <div style={{maxWidth:"640px",margin:"0 auto"}}>
+      <div style={CARD}>
+        <div style={{backgroundColor:COLOR_DARK,color:"white",padding:"20px 24px"}}>
+          <h2 style={{margin:0,fontSize:"18px",fontWeight:"700"}}>Nueva Solicitud</h2>
+          <p style={{margin:"4px 0 0",fontSize:"13px",color:"#93c5fd"}}>{miEmpleado.nombre} — {miEmpleado.cargo}</p>
+        </div>
+        <div style={{padding:"24px",display:"flex",flexDirection:"column",gap:"20px"}}>
+          <div style={{padding:"10px 14px",backgroundColor:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:"8px",fontSize:"13px",color:"#1e40af"}}>
+            🏖️ Tu saldo actual disponible: <strong>{saldoActual} día(s)</strong>
+            {miEmpleado.jefeCi&&<div style={{marginTop:"2px"}}>Tu solicitud será enviada a tu jefe inmediato para aprobación.</div>}
+            {!miEmpleado.jefeCi&&<div style={{marginTop:"2px",color:"#92400e"}}>⚠️ No tienes un jefe asignado. Pide a RRHH que lo configure.</div>}
+          </div>
+          <div>
+            <div style={LBL}>Tipo de solicitud</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px"}}>
+              {Object.entries(TIPO_CFG).map(([v,t])=>(
+                <button key={v} onClick={()=>set("tipo",v)} style={{padding:"12px",borderRadius:"10px",border:`2px solid ${form.tipo===v?COLOR_RED:"#e5e7eb"}`,backgroundColor:form.tipo===v?"#fef2f2":"white",cursor:"pointer",textAlign:"left"}}>
+                  <div style={{fontSize:"22px"}}>{t.icon}</div>
+                  <div style={{fontWeight:"700",fontSize:"13px",color:form.tipo===v?COLOR_RED:"#374151",marginTop:"4px"}}>{t.label}</div>
+                  <div style={{fontSize:"11px",color:"#9ca3af"}}>{t.sub}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div style={LBL}>Período solicitado</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
+              <div><label style={LBL}>Fecha inicio *</label><input type="date" style={INP} value={form.fechaInicio} onChange={e=>set("fechaInicio",e.target.value)}/></div>
+              <div><label style={LBL}>Fecha fin *</label><input type="date" style={INP} value={form.fechaFin} min={form.fechaInicio} onChange={e=>set("fechaFin",e.target.value)}/></div>
+              <div><label style={LBL}>Fecha retorno (opcional)</label><input type="date" style={INP} value={form.fechaRetorno} onChange={e=>set("fechaRetorno",e.target.value)}/></div>
+              <div><label style={LBL}>Días hábiles estimados</label><div style={{...INP,backgroundColor:"#f9fafb",color:diasCalc>0?COLOR_RED:"#9ca3af",fontWeight:"600"}}>{diasCalc>0?`${diasCalc} día(s)`:"—"}</div></div>
+            </div>
+            {(fers.length>0||cumple)&&(
+              <div style={{marginTop:"10px",display:"flex",flexDirection:"column",gap:"6px"}}>
+                {fers.length>0&&<div style={{padding:"8px 12px",backgroundColor:"#fff7ed",border:"1px solid #fed7aa",borderRadius:"8px",fontSize:"12px",color:"#9a3412"}}><strong>🏳️ Feriados excluidos:</strong> {fers.map(f=>`${fmtD(f.fecha)} (${f.desc})`).join(", ")}</div>}
+                {cumple&&<div style={{padding:"8px 12px",backgroundColor:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:"8px",fontSize:"12px",color:"#166534"}}>🎉 Cumpleaños el {fmtD(cumple)} — ½ día libre sin descontar.</div>}
+              </div>
+            )}
+            {form.tipo==="VACACION"&&diasCalc>saldoActual&&(
+              <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",fontSize:"12px",color:"#dc2626"}}>
+                ⚠️ Estás solicitando {diasCalc} día(s), pero tu saldo disponible es de {saldoActual} día(s). Igual puedes enviarla, pero tu jefe verá esta misma advertencia al revisarla.
+              </div>
+            )}
+          </div>
+          <div>
+            <label style={LBL}>Modalidad</label>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
+              {MODALIDADES.map(m=>(
+                <button key={m.value} onClick={()=>set("modalidad",m.value)} style={{padding:"9px 12px",borderRadius:"8px",border:`1.5px solid ${form.modalidad===m.value?COLOR_RED:"#e5e7eb"}`,backgroundColor:form.modalidad===m.value?"#fef2f2":"white",color:form.modalidad===m.value?COLOR_RED:"#6b7280",fontWeight:form.modalidad===m.value?"700":"400",cursor:"pointer",fontSize:"13px"}}>{m.label}</button>
+              ))}
+            </div>
+            {form.modalidad==="HORA"&&<div style={{marginTop:"10px",display:"flex",alignItems:"center",gap:"10px"}}>
+              <label style={{...LBL,margin:0}}>Horas por día *</label>
+              <input type="number" min="0.5" max="8" step="0.5" style={{...INP,width:"80px"}} value={form.horasPorDia} onChange={e=>set("horasPorDia",e.target.value)}/>
+            </div>}
+          </div>
+          <div><label style={LBL}>Observaciones (opcional)</label><textarea style={{...INP,minHeight:"70px",resize:"vertical"}} value={form.observaciones} onChange={e=>set("observaciones",e.target.value)}/></div>
+          {error&&<div style={{padding:"10px 14px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",color:"#dc2626",fontSize:"13px"}}>⚠️ {error}</div>}
+          <button onClick={generar} disabled={saving} style={{...BTN_PRIMARY,width:"100%",padding:"13px",fontSize:"15px",opacity:saving?0.6:1}}>{saving?"Generando...":"✅ Generar y enviar formulario"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// VISTA: MIS SOLICITUDES (cualquier usuario, ve y cancela las propias)
+// ============================================================
+function MisSolicitudesView({miEmpleado, sols, recargar}){
+  const [sel,setSel]=useState(null);
+  const [showPrint,setShowPrint]=useState(false);
+  const [confirmDel,setConfirmDel]=useState(false);
+  const misSolicitudes=sols.filter(s=>s.ci===miEmpleado.ci).sort((a,b)=>(b.fechaSolicitud||"").localeCompare(a.fechaSolicitud||""));
+
+  const eliminar=async s=>{
+    await DB.solDelete(s.id);
+    setConfirmDel(false); setSel(null);
+    recargar();
+  };
+
+  if(!misSolicitudes.length) return <div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}><div style={{fontSize:"36px",marginBottom:"8px"}}>📭</div><p>Todavía no has generado ninguna solicitud.</p></div>;
+
+  if(showPrint&&sel) return(
+    <div>
+      <button onClick={()=>setShowPrint(false)} className="print-hidden" style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer",fontSize:"14px"}}>← Volver</button>
+      <div className="print-hidden" style={{marginBottom:"12px"}}>
+        <button onClick={()=>window.print()} style={BTN_PRIMARY}>🖨️ Imprimir</button>
+      </div>
+      <PrintForm s={sel}/>
+    </div>
+  );
+
+  if(sel){
+    const c=EC[sel.estado]||EC.Pendiente;
+    return(
+      <div>
+        <button onClick={()=>{setSel(null);setConfirmDel(false);}} style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer",fontSize:"14px"}}>← Lista</button>
+        <div style={CARD}>
+          <div style={{backgroundColor:COLOR_DARK,color:"white",padding:"20px 24px",display:"flex",justifyContent:"space-between"}}>
+            <div><h3 style={{margin:0,fontSize:"16px"}}>Solicitud N° {sel.numero}</h3><p style={{margin:"3px 0 0",color:"#93c5fd",fontSize:"13px"}}>{fmtD(sel.fechaInicio)} → {fmtD(sel.fechaFin)}</p></div>
+            <span style={{backgroundColor:c.bg,color:c.text,border:`1px solid ${c.border}`,padding:"4px 10px",borderRadius:"20px",fontSize:"12px",fontWeight:"600",height:"fit-content"}}>{sel.estado}</span>
+          </div>
+          <div style={{padding:"20px 24px"}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",fontSize:"13px"}}>
+              {[["Tipo",sel.tipo],["Modalidad",fmtMd(sel.modalidad,sel.horasPorDia)],["Días",`${sel.diasEstimados} día(s)`],["Jefe",sel.jefeNombre||"—"]].map(([k,v])=>(
+                <div key={k}><div style={{color:"#9ca3af",fontSize:"11px"}}>{k}</div><div style={{fontWeight:"600",color:"#1f2937"}}>{v}</div></div>
+              ))}
+              {sel.observaciones&&<div style={{gridColumn:"1/-1"}}><div style={{color:"#9ca3af",fontSize:"11px"}}>Observaciones</div><div style={{backgroundColor:"#f9fafb",padding:"8px",borderRadius:"6px"}}>{sel.observaciones}</div></div>}
+            </div>
+            <div style={{display:"flex",gap:"8px",marginTop:"20px",flexWrap:"wrap"}}>
+              <button onClick={()=>setShowPrint(true)} style={BTN_SECONDARY}>🖨️ Ver / Imprimir formulario</button>
+              {sel.estado==="Pendiente"&&!confirmDel&&<button onClick={()=>setConfirmDel(true)} style={{...BTN_SECONDARY,color:"#dc2626",borderColor:"#fecaca"}}>🗑️ Eliminar solicitud</button>}
+              {confirmDel&&<>
+                <span style={{fontSize:"13px",color:"#dc2626",fontWeight:"600",alignSelf:"center"}}>¿Seguro que quieres eliminarla?</span>
+                <button onClick={()=>eliminar(sel)} style={{...BTN_PRIMARY,backgroundColor:"#dc2626"}}>Sí, eliminar</button>
+                <button onClick={()=>setConfirmDel(false)} style={BTN_SECONDARY}>Cancelar</button>
+              </>}
+            </div>
+            {sel.estado!=="Pendiente"&&<p style={{fontSize:"12px",color:"#9ca3af",marginTop:"10px"}}>Ya no se puede eliminar: esta solicitud ya fue {sel.estado==="Aprobada"?"aprobada":"rechazada"}.</p>}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return(
+    <div>
+      <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"14px"}}>Mis solicitudes</div>
+      <div style={{display:"flex",flexDirection:"column",gap:"8px"}}>
+        {misSolicitudes.map(s=>{
+          const c=EC[s.estado]||EC.Pendiente;
+          return(
+            <div key={s.id} onClick={()=>setSel(s)} style={{...CARD,padding:"14px 18px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontWeight:"600",fontSize:"14px"}}>N° {s.numero}</div>
+                <div style={{color:"#9ca3af",fontSize:"12px",marginTop:"3px"}}>📅 {fmtD(s.fechaInicio)} → {fmtD(s.fechaFin)} · {s.diasEstimados} día(s)</div>
+              </div>
+              <span style={{backgroundColor:c.bg,color:c.text,border:`1px solid ${c.border}`,padding:"4px 10px",borderRadius:"20px",fontSize:"11px",fontWeight:"600"}}>{s.estado}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// VISTA: APROBACIONES (para jefes)
+// ============================================================
+function AprobacionesView({miEmpleado, sols, recargar}){
+  const [sel,setSel]=useState(null);
+  const misSolicitudes=sols.filter(s=>s.jefeCi===miEmpleado.ci);
+
+  const cambiarEstado=async(s,est)=>{
+    await DB.solUpdate(s.id,{estado:est,fechaResolucion:new Date().toISOString(),resolvedByCi:miEmpleado.ci});
+    recargar(); setSel(null);
+  };
+
+  if(!misSolicitudes.length) return <div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}><div style={{fontSize:"36px",marginBottom:"8px"}}>📭</div><p>No tienes solicitudes de tu equipo por revisar.</p></div>;
+
+  if(sel){
+    const c=EC[sel.estado]||EC.Pendiente;
+    return(
+      <div>
+        <button onClick={()=>setSel(null)} style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer",fontSize:"14px"}}>← Lista</button>
+        <div style={CARD}>
+          <div style={{backgroundColor:COLOR_DARK,color:"white",padding:"20px 24px",display:"flex",justifyContent:"space-between"}}>
+            <div><h3 style={{margin:0,fontSize:"16px"}}>{sel.nombreEmpleado}</h3><p style={{margin:"3px 0 0",color:"#93c5fd",fontSize:"13px"}}>{sel.cargo}</p></div>
+            <span style={{backgroundColor:c.bg,color:c.text,border:`1px solid ${c.border}`,padding:"4px 10px",borderRadius:"20px",fontSize:"12px",fontWeight:"600",height:"fit-content"}}>{sel.estado}</span>
+          </div>
+          <div style={{padding:"20px 24px"}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",fontSize:"13px"}}>
+              {[["Tipo",sel.tipo],["Modalidad",fmtMd(sel.modalidad,sel.horasPorDia)],["Fecha inicio",fmtD(sel.fechaInicio)],["Fecha fin",fmtD(sel.fechaFin)],["Días",`${sel.diasEstimados} día(s)`],["Saldo al solicitar",sel.diasDisponibles]].map(([k,v])=>(
+                <div key={k}><div style={{color:"#9ca3af",fontSize:"11px"}}>{k}</div><div style={{fontWeight:"600",color:"#1f2937"}}>{v}</div></div>
+              ))}
+              {sel.observaciones&&<div style={{gridColumn:"1/-1"}}><div style={{color:"#9ca3af",fontSize:"11px"}}>Observaciones</div><div style={{backgroundColor:"#f9fafb",padding:"8px",borderRadius:"6px"}}>{sel.observaciones}</div></div>}
+            </div>
+            {sel.tipo==="VACACION"&&parseFloat(sel.diasEstimados)>parseFloat(sel.diasDisponibles||0)&&(
+              <div style={{marginTop:"14px",padding:"10px 14px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",fontSize:"13px",color:"#dc2626"}}>
+                ⚠️ Esta solicitud pide más días ({sel.diasEstimados}) de los que tenía disponibles al momento de solicitar ({sel.diasDisponibles}).
+              </div>
+            )}
+            {sel.estado==="Pendiente"&&<div style={{display:"flex",gap:"8px",marginTop:"20px"}}>
+              <button onClick={()=>cambiarEstado(sel,"Aprobada")} style={{...BTN_PRIMARY,backgroundColor:"#16a34a"}}>✅ Aprobar</button>
+              <button onClick={()=>cambiarEstado(sel,"Rechazada")} style={{...BTN_PRIMARY,backgroundColor:"#dc2626"}}>❌ Rechazar</button>
+            </div>}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return(
+    <div>
+      <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"14px"}}>Solicitudes de mi equipo</div>
+      <div style={{display:"flex",flexDirection:"column",gap:"8px"}}>
+        {misSolicitudes.map(s=>{
+          const c=EC[s.estado]||EC.Pendiente;
+          return(
+            <div key={s.id} onClick={()=>setSel(s)} style={{...CARD,padding:"14px 18px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontWeight:"600",fontSize:"14px"}}>{s.nombreEmpleado}</div>
+                <div style={{color:"#9ca3af",fontSize:"12px",marginTop:"3px"}}>📅 {fmtD(s.fechaInicio)} → {fmtD(s.fechaFin)} · {s.diasEstimados} día(s)</div>
+              </div>
+              <span style={{backgroundColor:c.bg,color:c.text,border:`1px solid ${c.border}`,padding:"4px 10px",borderRadius:"20px",fontSize:"11px",fontWeight:"600"}}>{s.estado}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PANEL RRHH — EMPLEADOS
+// ============================================================
+function RRHHEmpleados({emps, sols, recargar}){
+  const DEFAULT_EMP={id:"",nombre:"",ci:"",cargo:"",area:AREAS[0],sucursal:SUCURSALES[0],fechaIngreso:"",codigo:"",diasDisponibles:"",fechaCorteSaldo:"",fechaNacimiento:"",jefeCi:"",esRRHH:false,cuentaAdmin:false,horarioSemana:"L-V"};
+  const [form,setForm]=useState(DEFAULT_EMP);
+  const [editing,setEditing]=useState(false);
+  const [msg,setMsg]=useState("");
+  const [importText,setImportText]=useState("");
+  const [showImport,setShowImport]=useState(false);
+  const [confirmDelId,setConfirmDelId]=useState("");
+  const [busqueda,setBusqueda]=useState("");
+  const [filtroArea,setFiltroArea]=useState("");
+  const [filtroSucursal,setFiltroSucursal]=useState("");
+  const [ordenarPor,setOrdenarPor]=useState("nombre"); // nombre | ci | codigo | area | sucursal | fechaIngreso | saldo
+  const [ordenDesc,setOrdenDesc]=useState(false);
+  const setF=(k,v)=>setForm(p=>({...p,[k]:v}));
+
+  const b=busqueda.trim().toLowerCase();
+  const areasUsadas=[...new Set(emps.map(e=>e.area).filter(Boolean))].sort();
+  const sucursalesUsadas=[...new Set(emps.map(e=>e.sucursal).filter(Boolean))].sort();
+
+  const empsFiltrados=emps
+    .filter(e=>!b||[e.nombre,e.ci,e.cargo,e.area,e.sucursal,e.codigo].filter(Boolean).some(v=>String(v).toLowerCase().includes(b)))
+    .filter(e=>!filtroArea||e.area===filtroArea)
+    .filter(e=>!filtroSucursal||e.sucursal===filtroSucursal)
+    .sort((a,b2)=>{
+      let va,vb;
+      if(ordenarPor==="saldo"){ va=calcSaldoActual(a,sols); vb=calcSaldoActual(b2,sols); }
+      else if(ordenarPor==="codigo"){ va=parseFloat(a.codigo)||0; vb=parseFloat(b2.codigo)||0; }
+      else { va=(a[ordenarPor]||"").toString().toLowerCase(); vb=(b2[ordenarPor]||"").toString().toLowerCase(); }
+      const cmp=va<vb?-1:va>vb?1:0;
+      return ordenDesc?-cmp:cmp;
+    });
+
+  const guardar=async()=>{
+    if(!form.nombre.trim()){setMsg("⚠️ El nombre es obligatorio.");return;}
+    const nuevo={...form,fechaCorteSaldo:hoyISO()};
+    await DB.empSave(nuevo);
+    if(nuevo.uid) await DB.roleSet(nuevo.uid,nuevo.esRRHH);
+    setForm(DEFAULT_EMP); setEditing(false);
+    setMsg("✅ Empleado guardado."); setTimeout(()=>setMsg(""),3000);
+    recargar();
+  };
+  const editar=e=>{
+    const saldoHoy=calcSaldoActual(e,sols);
+    setForm({...DEFAULT_EMP,...e,diasDisponibles:String(saldoHoy)});
+    setEditing(true);
+  };
+  const eliminar=async id=>{
+    await DB.empDelete(id); setConfirmDelId("");
+    setMsg("🗑️ Empleado eliminado."); setTimeout(()=>setMsg(""),3000);
+    recargar();
+  };
+  const importarCSV=async()=>{
+    const lineas=importText.trim().split("\n").filter(l=>l.trim());
+    if(!lineas.length){setMsg("⚠️ El texto está vacío.");return;}
+    let inicio=0;
+    if(lineas[0].toLowerCase().replace(/"/g,"").trim().startsWith("nombre")) inicio=1;
+    let creados=0, actualizados=0;
+    for(let i=inicio;i<lineas.length;i++){
+      const cols=lineas[i].split(",").map(c=>c.trim().replace(/"/g,""));
+      if(!cols[0]) continue;
+      const ci=cols[1]||"";
+      const datosNuevo={nombre:cols[0]||"",ci,cargo:cols[2]||"",area:cols[3]||"",fechaNacimiento:cols[4]||"",
+        sucursal:cols[5]||"",fechaIngreso:cols[6]||"",codigo:cols[7]||"",diasDisponibles:cols[8]||"",horarioSemana:cols[9]||""};
+      const existente=ci?emps.find(x=>x.ci===ci):null;
+      if(existente){
+        const merged={};
+        Object.keys(datosNuevo).forEach(k=>{ if(datosNuevo[k]!=="") merged[k]=datosNuevo[k]; });
+        if(datosNuevo.diasDisponibles!=="") merged.fechaCorteSaldo=hoyISO();
+        await DB.empSave({id:existente.id,...merged}); actualizados++;
+      } else {
+        await DB.empSave({area:AREAS[0],sucursal:SUCURSALES[0],fechaCorteSaldo:hoyISO(),jefeCi:"",esRRHH:false,cuentaAdmin:false,horarioSemana:"L-V",...datosNuevo}); creados++;
+      }
+    }
+    setImportText(""); setShowImport(false);
+    setMsg(`✅ ${creados} nuevo(s), ${actualizados} actualizado(s).`); setTimeout(()=>setMsg(""),5000);
+    recargar();
+  };
+
+  const exportarCSV=()=>{
+    const esc=v=>{
+      const s=(v===undefined||v===null)?"":String(v);
+      return s.includes(",")||s.includes('"')||s.includes("\n") ? `"${s.replace(/"/g,'""')}"` : s;
+    };
+    const filas=[["NombreCompleto","CI","Cargo","Area","FechaNacimiento","Sucursal","FechaIngreso","Codigo","DiasDisponibles","HorarioSemana","JefeCI","EsRRHH"]];
+    emps.forEach(e=>{
+      filas.push([e.nombre,e.ci,e.cargo,e.area,e.fechaNacimiento,e.sucursal,e.fechaIngreso,e.codigo,
+        calcSaldoActual(e,sols),e.horarioSemana||"L-V",e.jefeCi||"",e.esRRHH?"SI":"NO"]);
+    });
+    const csv=filas.map(f=>f.map(esc).join(",")).join("\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url; a.download=`empleados_agromel_${hoyISO()}.csv`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const I={...INP,fontSize:"13px",padding:"8px 12px"};
+  const L={...LBL,fontSize:"12px",marginBottom:"4px"};
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"16px",flexWrap:"wrap",gap:"8px"}}>
+        <div style={{fontSize:"16px",fontWeight:"700"}}>Empleados ({empsFiltrados.length}{b?` de ${emps.length}`:""})</div>
+        <div style={{display:"flex",gap:"8px"}}>
+          <button onClick={exportarCSV} style={BTN_SECONDARY}>💾 Exportar CSV</button>
+          <button onClick={()=>setShowImport(p=>!p)} style={BTN_SECONDARY}>📂 Importar CSV</button>
+          <button onClick={()=>{setEditing(true);setForm(DEFAULT_EMP);}} style={BTN_PRIMARY}>+ Agregar</button>
+        </div>
+      </div>
+      <input value={busqueda} onChange={e=>setBusqueda(e.target.value)} placeholder="🔍 Buscar por nombre, CI, cargo, área, sucursal o código..." style={{...INP,marginBottom:"10px"}}/>
+      <div style={{display:"flex",gap:"8px",flexWrap:"wrap",marginBottom:"16px",alignItems:"center"}}>
+        <select value={filtroArea} onChange={e=>setFiltroArea(e.target.value)} style={{...INP,width:"auto",fontSize:"13px",padding:"7px 10px"}}>
+          <option value="">Todas las áreas</option>
+          {areasUsadas.map(a=><option key={a} value={a}>{a}</option>)}
+        </select>
+        <select value={filtroSucursal} onChange={e=>setFiltroSucursal(e.target.value)} style={{...INP,width:"auto",fontSize:"13px",padding:"7px 10px"}}>
+          <option value="">Todas las sucursales</option>
+          {sucursalesUsadas.map(s=><option key={s} value={s}>{s}</option>)}
+        </select>
+        <span style={{fontSize:"12px",color:"#9ca3af"}}>Ordenar por:</span>
+        <select value={ordenarPor} onChange={e=>setOrdenarPor(e.target.value)} style={{...INP,width:"auto",fontSize:"13px",padding:"7px 10px"}}>
+          <option value="nombre">Nombre</option>
+          <option value="ci">CI</option>
+          <option value="codigo">Código</option>
+          <option value="area">Área</option>
+          <option value="sucursal">Sucursal</option>
+          <option value="fechaIngreso">Fecha de ingreso</option>
+          <option value="saldo">Saldo actual</option>
+        </select>
+        <button onClick={()=>setOrdenDesc(d=>!d)} style={{...BTN_SECONDARY,padding:"7px 12px",fontSize:"13px"}}>{ordenDesc?"↓ Descendente":"↑ Ascendente"}</button>
+        {(filtroArea||filtroSucursal||busqueda)&&<button onClick={()=>{setFiltroArea("");setFiltroSucursal("");setBusqueda("");}} style={{...BTN_SECONDARY,padding:"7px 12px",fontSize:"13px",color:COLOR_RED}}>✕ Limpiar filtros</button>}
+      </div>
+      {msg&&<div style={{marginBottom:"12px",padding:"10px 14px",backgroundColor:msg.startsWith("⚠️")?"#fef2f2":"#f0fdf4",border:`1px solid ${msg.startsWith("⚠️")?"#fecaca":"#bbf7d0"}`,borderRadius:"8px",color:msg.startsWith("⚠️")?"#dc2626":"#166534",fontSize:"13px"}}>{msg}</div>}
+      {showImport&&(
+        <div style={{marginBottom:"16px",padding:"16px",backgroundColor:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:"10px"}}>
+          <div style={{fontSize:"12px",color:"#6b7280",marginBottom:"8px"}}>
+            Formato: <code style={{backgroundColor:"#e5e7eb",padding:"1px 6px",borderRadius:"4px"}}>NombreCompleto, CI, Cargo, Area, FechaNacimiento, Sucursal, FechaIngreso, Codigo, DiasDisponibles</code>
+          </div>
+          <textarea value={importText} onChange={e=>setImportText(e.target.value)} style={{width:"100%",height:"120px",border:"1.5px solid #d1d5db",borderRadius:"8px",padding:"8px 12px",fontSize:"12px",fontFamily:"monospace",boxSizing:"border-box"}}/>
+          <div style={{display:"flex",gap:"8px",marginTop:"8px"}}>
+            <button onClick={importarCSV} style={BTN_PRIMARY}>Importar</button>
+            <button onClick={()=>{setShowImport(false);setImportText("");}} style={BTN_SECONDARY}>Cancelar</button>
+          </div>
+        </div>
+      )}
+      {editing&&(
+        <div style={{marginBottom:"16px",padding:"16px",backgroundColor:"#f9fafb",border:`1.5px solid ${COLOR_RED}`,borderRadius:"10px"}}>
+          <div style={{fontSize:"13px",fontWeight:"700",color:COLOR_RED,marginBottom:"12px"}}>{form.id?"Editar empleado":"Nuevo empleado"}</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px"}}>
+            <div style={{gridColumn:"1/-1"}}><label style={L}>Nombre completo *</label><input style={I} value={form.nombre} onChange={e=>setF("nombre",e.target.value)}/></div>
+            <div><label style={L}>CI</label><input style={I} value={form.ci} onChange={e=>setF("ci",e.target.value)}/></div>
+            <div><label style={L}>Fecha de nacimiento</label><input type="date" style={I} value={form.fechaNacimiento} onChange={e=>setF("fechaNacimiento",e.target.value)}/></div>
+            <div><label style={L}>Cargo</label><input style={I} value={form.cargo} onChange={e=>setF("cargo",e.target.value)}/></div>
+            <div><label style={L}>Área</label><select style={I} value={form.area} onChange={e=>setF("area",e.target.value)}>{AREAS.map(a=><option key={a}>{a}</option>)}</select></div>
+            <div><label style={L}>Sucursal</label><select style={I} value={form.sucursal} onChange={e=>setF("sucursal",e.target.value)}>{SUCURSALES.map(a=><option key={a}>{a}</option>)}</select></div>
+            <div><label style={L}>Fecha de ingreso</label><input type="date" style={I} value={form.fechaIngreso} onChange={e=>setF("fechaIngreso",e.target.value)}/></div>
+            <div><label style={L}>Código</label><input style={I} value={form.codigo} onChange={e=>setF("codigo",e.target.value)}/></div>
+            <div>
+              <label style={L}>Horario semanal</label>
+              <select style={I} value={form.horarioSemana||"L-V"} onChange={e=>setF("horarioSemana",e.target.value)}>
+                <option value="L-V">Lunes a Viernes (sáb. y dom. libres)</option>
+                <option value="L-S">Lunes a Sábado (solo dom. libre)</option>
+              </select>
+            </div>
+            <div>
+              <label style={L}>Jefe inmediato</label>
+              <select style={I} value={form.jefeCi} onChange={e=>setF("jefeCi",e.target.value)}>
+                <option value="">— Sin jefe asignado —</option>
+                {emps.filter(x=>x.ci!==form.ci&&!x.cuentaAdmin).map(x=><option key={x.id} value={x.ci}>{x.nombre} ({x.cargo})</option>)}
+              </select>
+            </div>
+            <div style={{gridColumn:"1/-1"}}>
+              <label style={L}>Días disponibles (saldo a hoy)</label>
+              <input type="number" step="0.5" style={I} value={form.diasDisponibles} onChange={e=>setF("diasDisponibles",e.target.value)}/>
+              {form.fechaIngreso&&<div style={{marginTop:"4px",fontSize:"11px",color:"#6b7280",display:"flex",alignItems:"center",gap:"6px",flexWrap:"wrap"}}>
+                <span>Antigüedad: {calcAntiguedadTxt(form.fechaIngreso)}. Acumulado según Ley desde ingreso: <strong>{calcDiasAcumulados(form.fechaIngreso)}</strong> día(s).</span>
+                <button type="button" onClick={()=>setF("diasDisponibles",String(calcDiasAcumulados(form.fechaIngreso)))} style={{padding:"2px 8px",borderRadius:"6px",border:`1px solid ${COLOR_RED}`,backgroundColor:"white",color:COLOR_RED,cursor:"pointer",fontSize:"11px"}}>Usar este valor</button>
+              </div>}
+            </div>
+            <div style={{gridColumn:"1/-1",display:"flex",alignItems:"center",gap:"8px"}}>
+              <input type="checkbox" id="esRRHH" checked={!!form.esRRHH} onChange={e=>setF("esRRHH",e.target.checked)}/>
+              <label htmlFor="esRRHH" style={{fontSize:"13px",color:"#374151"}}>Tiene acceso al Panel RRHH</label>
+            </div>
+            <div style={{gridColumn:"1/-1",display:"flex",alignItems:"center",gap:"8px"}}>
+              <input type="checkbox" id="cuentaAdmin" checked={!!form.cuentaAdmin} onChange={e=>setF("cuentaAdmin",e.target.checked)}/>
+              <label htmlFor="cuentaAdmin" style={{fontSize:"13px",color:"#374151"}}>Cuenta administrativa (sin vacaciones — no aparece "Solicitar")</label>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:"8px",marginTop:"12px"}}>
+            <button onClick={guardar} style={BTN_PRIMARY}>💾 Guardar</button>
+            <button onClick={()=>{setEditing(false);setForm(DEFAULT_EMP);}} style={BTN_SECONDARY}>Cancelar</button>
+          </div>
+        </div>
+      )}
+      {empsFiltrados.length===0?<div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}>{emps.length===0?"No hay empleados aún.":"No se encontraron empleados con esa búsqueda."}</div>:
+      <div style={{display:"flex",flexDirection:"column",gap:"6px"}}>
+        {empsFiltrados.map(e=>(
+          <div key={e.id} style={{backgroundColor:"white",borderRadius:"8px",padding:"12px 16px",border:"1px solid #e5e7eb",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div>
+              <div style={{fontWeight:"600",fontSize:"14px"}}>{e.nombre} {e.esRRHH&&<span style={{fontSize:"10px",backgroundColor:"#eff6ff",color:"#1e40af",padding:"1px 6px",borderRadius:"8px",marginLeft:"6px"}}>RRHH</span>} {e.cuentaAdmin&&<span style={{fontSize:"10px",backgroundColor:"#fdf4ff",color:"#86198f",padding:"1px 6px",borderRadius:"8px",marginLeft:"6px"}}>CUENTA ADMIN (sin vacaciones)</span>}</div>
+              <div style={{fontSize:"12px",color:"#9ca3af",marginTop:"2px"}}>
+                {[e.ci&&`CI: ${e.ci}`,e.cargo,e.area,e.sucursal,e.uid?"✅ cuenta creada":"⏳ sin cuenta"].filter(Boolean).join(" · ")}
+              </div>
+              {e.fechaIngreso&&<div style={{fontSize:"11px",color:COLOR_RED,fontWeight:"600",marginTop:"2px"}}>🏖️ Saldo actual: {calcSaldoActual(e,sols)} día(s)</div>}
+            </div>
+            <div style={{display:"flex",gap:"6px",alignItems:"center"}}>
+              {confirmDelId===e.id?(
+                <>
+                  <span style={{fontSize:"12px",color:"#dc2626",fontWeight:"600"}}>¿Eliminar?</span>
+                  <button onClick={()=>eliminar(e.id)} style={{padding:"5px 10px",borderRadius:"6px",border:"none",backgroundColor:"#dc2626",color:"white",cursor:"pointer",fontSize:"12px",fontWeight:"600"}}>Sí</button>
+                  <button onClick={()=>setConfirmDelId("")} style={{padding:"5px 10px",borderRadius:"6px",border:"1.5px solid #e5e7eb",backgroundColor:"white",cursor:"pointer",fontSize:"12px"}}>No</button>
+                </>
+              ):(
+                <>
+                  <button onClick={()=>editar(e)} style={{padding:"5px 10px",borderRadius:"6px",border:"1.5px solid #e5e7eb",backgroundColor:"white",cursor:"pointer",fontSize:"12px"}}>✏️</button>
+                  <button onClick={()=>setConfirmDelId(e.id)} style={{padding:"5px 10px",borderRadius:"6px",border:"none",backgroundColor:"#fef2f2",color:"#dc2626",cursor:"pointer",fontSize:"12px"}}>🗑️</button>
+                </>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>}
+    </div>
+  );
+}
+
+// ============================================================
+// PANEL RRHH — SOLICITUDES (todas)
+// ============================================================
+function RRHHSolicitudes({sols, recargar}){
+  const [filtro,setFiltro]=useState("Todas");
+  const [busqueda,setBusqueda]=useState("");
+  const [sel,setSel]=useState(null);
+  const [confirmDel,setConfirmDel]=useState(false);
+  const ESTADOS=["Todas","Pendiente","Aprobada","Rechazada"];
+  const b=busqueda.trim().toLowerCase();
+  const filtradas=sols
+    .filter(s=>filtro==="Todas"||s.estado===filtro)
+    .filter(s=>!b||[s.nombreEmpleado,s.ci,s.cargo,s.area,s.jefeNombre].filter(Boolean).some(v=>v.toLowerCase().includes(b)));
+
+  const cambiarEstado=async(s,est)=>{
+    await DB.solUpdate(s.id,{estado:est,fechaResolucion:new Date().toISOString()});
+    recargar(); setSel(null);
+  };
+
+  const eliminar=async s=>{
+    await DB.solDelete(s.id);
+    setConfirmDel(false); setSel(null);
+    recargar();
+  };
+
+  if(sel){
+    const c=EC[sel.estado]||EC.Pendiente;
+    return(
+      <div>
+        <button onClick={()=>{setSel(null);setConfirmDel(false);}} style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer"}}>← Lista</button>
+        <div style={CARD}>
+          <div style={{backgroundColor:COLOR_DARK,color:"white",padding:"20px 24px",display:"flex",justifyContent:"space-between"}}>
+            <div><h3 style={{margin:0,fontSize:"16px"}}>{sel.nombreEmpleado}</h3><p style={{margin:"3px 0 0",color:"#93c5fd",fontSize:"13px"}}>{sel.cargo} — {sel.area}</p></div>
+            <span style={{backgroundColor:c.bg,color:c.text,border:`1px solid ${c.border}`,padding:"4px 10px",borderRadius:"20px",fontSize:"12px",fontWeight:"600",height:"fit-content"}}>{sel.estado}</span>
+          </div>
+          <div style={{padding:"20px 24px"}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",fontSize:"13px"}}>
+              {[["N°",sel.numero],["Jefe",sel.jefeNombre||"—"],["Tipo",sel.tipo],["Modalidad",fmtMd(sel.modalidad,sel.horasPorDia)],["Inicio",fmtD(sel.fechaInicio)],["Fin",fmtD(sel.fechaFin)],["Días",`${sel.diasEstimados} día(s)`],["CI",sel.ci]].map(([k,v])=>(
+                <div key={k}><div style={{color:"#9ca3af",fontSize:"11px"}}>{k}</div><div style={{fontWeight:"600"}}>{v}</div></div>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:"8px",marginTop:"20px",flexWrap:"wrap"}}>
+              {sel.estado!=="Aprobada"&&<button onClick={()=>cambiarEstado(sel,"Aprobada")} style={{...BTN_PRIMARY,backgroundColor:"#16a34a"}}>✅ Aprobar</button>}
+              {sel.estado!=="Rechazada"&&<button onClick={()=>cambiarEstado(sel,"Rechazada")} style={{...BTN_PRIMARY,backgroundColor:"#dc2626"}}>❌ Rechazar</button>}
+              {sel.estado!=="Pendiente"&&<button onClick={()=>cambiarEstado(sel,"Pendiente")} style={{...BTN_PRIMARY,backgroundColor:"#ca8a04"}}>🔄 Volver a pendiente</button>}
+              {!confirmDel&&<button onClick={()=>setConfirmDel(true)} style={{...BTN_SECONDARY,color:"#dc2626",borderColor:"#fecaca"}}>🗑️ Eliminar</button>}
+              {confirmDel&&<>
+                <span style={{fontSize:"13px",color:"#dc2626",fontWeight:"600",alignSelf:"center"}}>¿Eliminar definitivamente?</span>
+                <button onClick={()=>eliminar(sel)} style={{...BTN_PRIMARY,backgroundColor:"#dc2626"}}>Sí, eliminar</button>
+                <button onClick={()=>setConfirmDel(false)} style={BTN_SECONDARY}>Cancelar</button>
+              </>}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return(
+    <div>
+      <input value={busqueda} onChange={e=>setBusqueda(e.target.value)} placeholder="🔍 Buscar por nombre, CI, cargo o área..." style={{...INP,marginBottom:"12px"}}/>
+      <div style={{display:"flex",gap:"6px",marginBottom:"14px",flexWrap:"wrap"}}>
+        {ESTADOS.map(e=><button key={e} onClick={()=>setFiltro(e)} style={{padding:"6px 14px",borderRadius:"20px",border:`1.5px solid ${filtro===e?COLOR_RED:"#e5e7eb"}`,backgroundColor:filtro===e?COLOR_RED:"white",color:filtro===e?"white":"#6b7280",cursor:"pointer",fontSize:"13px"}}>{e}</button>)}
+      </div>
+      {filtradas.length===0?<div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}>No hay solicitudes.</div>:
+      <div style={{display:"flex",flexDirection:"column",gap:"8px"}}>
+        {filtradas.map(s=>{
+          const c=EC[s.estado]||EC.Pendiente;
+          return(
+            <div key={s.id} onClick={()=>setSel(s)} style={{...CARD,padding:"14px 18px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontWeight:"600",fontSize:"14px"}}>{s.nombreEmpleado}</div>
+                <div style={{color:"#9ca3af",fontSize:"12px",marginTop:"3px"}}>📅 {fmtD(s.fechaInicio)} → {fmtD(s.fechaFin)} · {s.diasEstimados} día(s) · Jefe: {s.jefeNombre||"—"}</div>
+              </div>
+              <span style={{backgroundColor:c.bg,color:c.text,border:`1px solid ${c.border}`,padding:"4px 10px",borderRadius:"20px",fontSize:"11px",fontWeight:"600"}}>{s.estado}</span>
+            </div>
+          );
+        })}
+      </div>}
+    </div>
+  );
+}
+
+// ============================================================
+// PANEL RRHH — REGISTRAR VACACIÓN YA TOMADA (retroactiva, queda Aprobada)
+// ============================================================
+function RRHHRegistrarVacacion({emps, sols, recargar}){
+  const [empId,setEmpId]=useState("");
+  const [tipo,setTipo]=useState("VACACION");
+  const [fechaInicio,setFechaInicio]=useState("");
+  const [fechaFin,setFechaFin]=useState("");
+  const [observaciones,setObservaciones]=useState("");
+  const [error,setError]=useState("");
+  const [msg,setMsg]=useState("");
+  const [saving,setSaving]=useState(false);
+
+  const emp=emps.find(e=>e.id===empId);
+  const saldoActual=emp?calcSaldoActual(emp,sols):0;
+  const diasCalc=(emp&&fechaInicio&&fechaFin)?calcDias(fechaInicio,fechaFin,"DIA_COMPLETO","1",[],emp.fechaNacimiento||null,emp.horarioSemana||"L-V"):{dias:0,feriadosEnRango:[],cumpleEnRango:null};
+
+  const registrar=async()=>{
+    setError(""); setMsg("");
+    if(!emp){setError("Selecciona un empleado.");return;}
+    if(!fechaInicio||!fechaFin){setError("Completa las fechas.");return;}
+    if(fechaFin<fechaInicio){setError("La fecha fin no puede ser menor a la de inicio.");return;}
+    setSaving(true);
+    try{
+      const jefe=emp.jefeCi?await DB.empGetByCi(emp.jefeCi):null;
+      const nueva={
+        numero:genNum(), empleadoCi:emp.ci, nombreEmpleado:emp.nombre, ci:emp.ci,
+        cargo:emp.cargo, area:emp.area, sucursal:emp.sucursal||"", fechaIngreso:emp.fechaIngreso||"",
+        codigo:emp.codigo||"", diasDisponibles:String(saldoActual),
+        tipo, modalidad:"DIA_COMPLETO", horasPorDia:"1",
+        fechaInicio, fechaFin, fechaRetorno:"",
+        observaciones:observaciones||"Registrada por RRHH (vacación ya tomada).",
+        diasEstimados:diasCalc.dias, feriadosEnRango:diasCalc.feriadosEnRango, cumpleEnRango:diasCalc.cumpleEnRango,
+        estado:"Aprobada", jefeCi:emp.jefeCi||"", jefeNombre:jefe?jefe.nombre:"",
+        fechaSolicitud:new Date().toISOString(), fechaResolucion:new Date().toISOString(),
+        registradaPorRRHH:true,
+      };
+      await DB.solCreate(nueva);
+      setMsg(`✅ Registrada: se descontaron ${diasCalc.dias} día(s) del saldo de ${emp.nombre}.`);
+      setEmpId(""); setFechaInicio(""); setFechaFin(""); setObservaciones("");
+      recargar();
+    }catch(e){ setError("No se pudo registrar. Intenta de nuevo."); }
+    setSaving(false);
+  };
+
+  return(
+    <div style={{maxWidth:"560px"}}>
+      <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"6px"}}>Registrar vacación ya tomada</div>
+      <p style={{fontSize:"12px",color:"#9ca3af",marginBottom:"16px"}}>Úsalo para empleados que ya pidieron y tomaron sus vacaciones fuera del sistema — queda registrada como Aprobada de inmediato y descuenta su saldo.</p>
+      {msg&&<div style={{padding:"10px 14px",backgroundColor:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:"8px",color:"#166534",fontSize:"13px",marginBottom:"12px"}}>{msg}</div>}
+      {error&&<div style={{padding:"10px 14px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",color:"#dc2626",fontSize:"13px",marginBottom:"12px"}}>⚠️ {error}</div>}
+      <div style={{display:"flex",flexDirection:"column",gap:"12px"}}>
+        <div>
+          <label style={LBL}>Empleado *</label>
+          <select style={INP} value={empId} onChange={e=>setEmpId(e.target.value)}>
+            <option value="">— Selecciona —</option>
+            {emps.filter(e=>!e.cuentaAdmin).sort((a,b)=>a.nombre.localeCompare(b.nombre)).map(e=><option key={e.id} value={e.id}>{e.nombre} ({e.ci})</option>)}
+          </select>
+          {emp&&<div style={{marginTop:"4px",fontSize:"12px",color:COLOR_RED,fontWeight:"600"}}>Saldo actual: {saldoActual} día(s)</div>}
+        </div>
+        <div>
+          <label style={LBL}>Tipo</label>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
+            {Object.entries(TIPO_CFG).map(([v,t])=>(
+              <button key={v} onClick={()=>setTipo(v)} style={{padding:"9px 12px",borderRadius:"8px",border:`1.5px solid ${tipo===v?COLOR_RED:"#e5e7eb"}`,backgroundColor:tipo===v?"#fef2f2":"white",color:tipo===v?COLOR_RED:"#6b7280",fontWeight:tipo===v?"700":"400",cursor:"pointer",fontSize:"13px"}}>{t.icon} {t.label}</button>
+            ))}
+          </div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
+          <div><label style={LBL}>Fecha inicio *</label><input type="date" style={INP} value={fechaInicio} onChange={e=>setFechaInicio(e.target.value)}/></div>
+          <div><label style={LBL}>Fecha fin *</label><input type="date" style={INP} value={fechaFin} min={fechaInicio} onChange={e=>setFechaFin(e.target.value)}/></div>
+        </div>
+        {emp&&fechaInicio&&fechaFin&&<div style={{padding:"8px 12px",backgroundColor:"#f9fafb",borderRadius:"8px",fontSize:"13px"}}>Días hábiles: <strong>{diasCalc.dias}</strong></div>}
+        <div><label style={LBL}>Observaciones (opcional)</label><textarea style={{...INP,minHeight:"60px",resize:"vertical"}} value={observaciones} onChange={e=>setObservaciones(e.target.value)}/></div>
+        <button onClick={registrar} disabled={saving} style={{...BTN_PRIMARY,opacity:saving?0.6:1}}>{saving?"Registrando...":"✅ Registrar como Aprobada"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PANEL RRHH — FERIADOS
+// ============================================================
+function RRHHFeriados(){
+  const curYear=new Date().getFullYear();
+  const [year,setYear]=useState(curYear);
+  const [ferVar,setFerVar]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [fechaNueva,setFechaNueva]=useState("");
+  const [descNueva,setDescNueva]=useState("");
+
+  const cargar=async y=>{setLoading(true); setFerVar(await DB.ferGet(y)); setLoading(false);};
+  useEffect(()=>{cargar(year);},[year]);
+
+  const agregar=async()=>{
+    if(!fechaNueva||!descNueva.trim()) return;
+    const nueva=[...ferVar,{fecha:fechaNueva,desc:descNueva}].sort((a,b)=>a.fecha.localeCompare(b.fecha));
+    await DB.ferSet(year,nueva); setFerVar(nueva); setFechaNueva(""); setDescNueva("");
+  };
+  const eliminar=async fecha=>{
+    const nueva=ferVar.filter(f=>f.fecha!==fecha); await DB.ferSet(year,nueva); setFerVar(nueva);
+  };
+  const todos=[...FERIADOS_FIJOS.map(f=>({tipo:"fijo",fecha:`${year}-${f.md}`,desc:f.desc})),...ferVar.map(f=>({tipo:"variable",...f}))].sort((a,b)=>a.fecha.localeCompare(b.fecha));
+
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"16px"}}>
+        <div style={{fontSize:"16px",fontWeight:"700"}}>Feriados</div>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <button onClick={()=>setYear(y=>y-1)} style={{padding:"6px 10px",borderRadius:"6px",border:"1.5px solid #e5e7eb",backgroundColor:"white",cursor:"pointer"}}>‹</button>
+          <span style={{fontWeight:"700"}}>{year}</span>
+          <button onClick={()=>setYear(y=>y+1)} style={{padding:"6px 10px",borderRadius:"6px",border:"1.5px solid #e5e7eb",backgroundColor:"white",cursor:"pointer"}}>›</button>
+        </div>
+      </div>
+      <div style={{marginBottom:"16px",padding:"14px",backgroundColor:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:"10px",display:"flex",gap:"8px",flexWrap:"wrap",alignItems:"flex-end"}}>
+        <div><div style={{fontSize:"12px",fontWeight:"600",marginBottom:"4px"}}>Fecha</div><input type="date" style={{border:"1.5px solid #d1d5db",borderRadius:"8px",padding:"8px 12px"}} value={fechaNueva} onChange={e=>setFechaNueva(e.target.value)} min={`${year}-01-01`} max={`${year}-12-31`}/></div>
+        <div style={{flex:1}}><div style={{fontSize:"12px",fontWeight:"600",marginBottom:"4px"}}>Descripción</div><input style={{width:"100%",boxSizing:"border-box",border:"1.5px solid #d1d5db",borderRadius:"8px",padding:"8px 12px"}} value={descNueva} onChange={e=>setDescNueva(e.target.value)} placeholder="Ej: Carnaval"/></div>
+        <button onClick={agregar} style={BTN_PRIMARY}>Agregar</button>
+      </div>
+      {loading?<div style={{textAlign:"center",padding:"30px",color:"#9ca3af"}}>Cargando...</div>:
+      <div style={{display:"flex",flexDirection:"column",gap:"4px"}}>
+        {todos.map((f,i)=>(
+          <div key={i} style={{backgroundColor:"white",borderRadius:"8px",padding:"10px 14px",border:"1px solid #e5e7eb",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{display:"flex",alignItems:"center",gap:"12px"}}>
+              <span style={{backgroundColor:f.tipo==="fijo"?"#eff6ff":"#fff7ed",color:f.tipo==="fijo"?"#1e40af":"#9a3412",padding:"2px 8px",borderRadius:"10px",fontSize:"10px",fontWeight:"600"}}>{f.tipo==="fijo"?"FIJO":"VARIABLE"}</span>
+              <span style={{fontWeight:"600",fontSize:"13px"}}>{fmtD(f.fecha)}</span>
+              <span style={{fontSize:"13px",color:"#6b7280"}}>{f.desc}</span>
+            </div>
+            {f.tipo==="variable"&&<button onClick={()=>eliminar(f.fecha)} style={{padding:"4px 8px",borderRadius:"6px",border:"none",backgroundColor:"#fef2f2",color:"#dc2626",cursor:"pointer"}}>🗑️</button>}
+          </div>
+        ))}
+      </div>}
+    </div>
+  );
+}
+
+// ============================================================
+// APP PRINCIPAL
+// ============================================================
+function CambiarPasswordModal({onClose}){
+  const [actual,setActual]=useState("");
+  const [nueva,setNueva]=useState("");
+  const [confirmar,setConfirmar]=useState("");
+  const [error,setError]=useState("");
+  const [msg,setMsg]=useState("");
+  const [loading,setLoading]=useState(false);
+
+  const guardar=async()=>{
+    setError(""); setMsg("");
+    if(!nueva||nueva.length<6){ setError("La nueva contraseña debe tener al menos 6 caracteres."); return; }
+    if(nueva!==confirmar){ setError("Las contraseñas no coinciden."); return; }
+    setLoading(true);
+    try{
+      const user=window.__fbAuth.currentUser;
+      if(actual){
+        const cred=firebase.auth.EmailAuthProvider.credential(user.email,actual);
+        await user.reauthenticateWithCredential(cred);
+      }
+      await user.updatePassword(nueva);
+      setMsg("✅ Contraseña actualizada correctamente.");
+      setActual(""); setNueva(""); setConfirmar("");
+    }catch(e){
+      setError(e.code==="auth/wrong-password"?"La contraseña actual no es correcta.":
+        e.code==="auth/requires-recent-login"?"Por seguridad, cierra sesión, vuelve a entrar, e intenta cambiarla de inmediato.":
+        e.code==="auth/weak-password"?"La contraseña es muy débil.":
+        "No se pudo cambiar la contraseña. Intenta de nuevo.");
+    }
+    setLoading(false);
+  };
+
+  return(
+    <div style={{position:"fixed",inset:0,backgroundColor:"rgba(0,0,0,0.4)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:50,padding:"16px"}} onClick={onClose}>
+      <div style={{...CARD,maxWidth:"360px",width:"100%",padding:"24px"}} onClick={e=>e.stopPropagation()}>
+        <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"14px"}}>🔑 Cambiar contraseña</div>
+        {msg&&<div style={{padding:"10px 14px",backgroundColor:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:"8px",color:"#166534",fontSize:"13px",marginBottom:"12px"}}>{msg}</div>}
+        {error&&<div style={{padding:"10px 14px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",color:"#dc2626",fontSize:"13px",marginBottom:"12px"}}>⚠️ {error}</div>}
+        <div style={{display:"flex",flexDirection:"column",gap:"10px"}}>
+          <PasswordField label="Contraseña actual (si te la pide)" value={actual} onChange={e=>setActual(e.target.value)}/>
+          <PasswordField label="Contraseña nueva" value={nueva} onChange={e=>setNueva(e.target.value)} placeholder="Mínimo 6 caracteres"/>
+          <PasswordField label="Confirmar contraseña nueva" value={confirmar} onChange={e=>setConfirmar(e.target.value)}/>
+          <button onClick={guardar} disabled={loading} style={{...BTN_PRIMARY,width:"100%"}}>{loading?"Guardando...":"Guardar"}</button>
+          <button onClick={onClose} style={{...BTN_SECONDARY,width:"100%"}}>Cerrar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AppMain(){
+  const [user,setUser]=useState(null);
+  const [authLoading,setAuthLoading]=useState(true);
+  const [miEmpleado,setMiEmpleado]=useState(null);
+  const [emps,setEmps]=useState([]);
+  const [sols,setSols]=useState([]);
+  const [view,setView]=useState("solicitar");
+  const [showPassModal,setShowPassModal]=useState(false);
+
+  const recargarTodo=async(uidActual)=>{
+    const [e,s]=await Promise.all([DB.empGetAll(),DB.solGetAll()]);
+    setEmps(e); setSols(s);
+    const uid=uidActual!==undefined?uidActual:user?.uid;
+    if(uid){ const mi=e.find(x=>x.uid===uid); setMiEmpleado(mi||null); }
+  };
+
+  useEffect(()=>{
+    const unsub=window.__fbAuth.onAuthStateChanged(async u=>{
+      setUser(u);
+      if(u){ await recargarTodo(u.uid); } else { setMiEmpleado(null); setEmps([]); setSols([]); }
+      setAuthLoading(false);
+    });
+    return unsub;
+  },[]);
+
+  useEffect(()=>{
+    if(miEmpleado?.cuentaAdmin && view==="solicitar") setView("rrhh_emp");
+  },[miEmpleado]);
+
+  if(authLoading) return <div style={{textAlign:"center",padding:"60px",color:"#9ca3af"}}>Cargando...</div>;
+  if(!user) return <AuthScreen/>;
+  if(!miEmpleado) return (
+    <div style={{maxWidth:"420px",margin:"60px auto",textAlign:"center",padding:"24px"}}>
+      <div style={{fontSize:"36px",marginBottom:"8px"}}>⏳</div>
+      <p style={{color:"#6b7280"}}>Tu cuenta se creó, pero aún no está vinculada a ningún registro de empleado. Contacta a RRHH.</p>
+      <button onClick={()=>window.__fbAuth.signOut()} style={{...BTN_SECONDARY,marginTop:"12px"}}>Cerrar sesión</button>
+    </div>
+  );
+
+  const tieneEquipo=emps.some(e=>e.jefeCi===miEmpleado.ci);
+  const esCuentaAdmin=!!miEmpleado.cuentaAdmin;
+  const TABS=[
+    ...(esCuentaAdmin?[]:[{id:"solicitar",label:"🏖️ Solicitar"},{id:"mis_sol",label:"📄 Mis Solicitudes"}]),
+    ...(!esCuentaAdmin&&tieneEquipo?[{id:"aprobaciones",label:"✅ Aprobaciones"}]:[]),
+    ...(miEmpleado.esRRHH?[{id:"rrhh_emp",label:"👥 Empleados"},{id:"rrhh_reg",label:"➕ Registrar Vacación"},{id:"rrhh_sol",label:"📋 Solicitudes"},{id:"rrhh_fer",label:"🏳️ Feriados"}]:[]),
+  ];
+
+  return(
+    <div style={{minHeight:"100vh",backgroundColor:"#f3f4f6"}}>
+      {showPassModal&&<CambiarPasswordModal onClose={()=>setShowPassModal(false)}/>}
+      <div className="print-hidden" style={{backgroundColor:COLOR_DARK,color:"white",padding:"12px 24px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:"8px"}}>
+        <div style={{fontWeight:"700",fontSize:"14px"}}>{COMPANY_FULL}</div>
+        <div style={{display:"flex",alignItems:"center",gap:"12px",fontSize:"13px"}}>
+          <span>{miEmpleado.nombre}</span>
+          <button onClick={()=>setShowPassModal(true)} style={{background:"none",border:"1px solid rgba(255,255,255,0.4)",color:"white",padding:"5px 12px",borderRadius:"6px",cursor:"pointer",fontSize:"12px"}}>🔑 Contraseña</button>
+          <button onClick={()=>window.__fbAuth.signOut()} style={{background:"none",border:"1px solid rgba(255,255,255,0.4)",color:"white",padding:"5px 12px",borderRadius:"6px",cursor:"pointer",fontSize:"12px"}}>Salir</button>
+        </div>
+      </div>
+      <div className="print-hidden" style={{maxWidth:"900px",margin:"0 auto",padding:"12px 16px 0",display:"flex",gap:"4px",flexWrap:"wrap",borderBottom:"2px solid #e5e7eb"}}>
+        {TABS.map(t=>(
+          <button key={t.id} onClick={()=>setView(t.id)} style={{padding:"10px 16px",border:"none",borderBottom:`2px solid ${view===t.id?COLOR_RED:"transparent"}`,marginBottom:"-2px",backgroundColor:"transparent",color:view===t.id?COLOR_RED:"#6b7280",fontWeight:view===t.id?"700":"400",cursor:"pointer",fontSize:"14px"}}>{t.label}</button>
+        ))}
+      </div>
+      <div style={{maxWidth:"900px",margin:"0 auto",padding:"24px 16px"}}>
+        {view==="solicitar"&&<SolicitarView miEmpleado={miEmpleado} sols={sols} recargar={recargarTodo}/>}
+        {view==="mis_sol"&&<MisSolicitudesView miEmpleado={miEmpleado} sols={sols} recargar={recargarTodo}/>}
+        {view==="aprobaciones"&&tieneEquipo&&<AprobacionesView miEmpleado={miEmpleado} sols={sols} recargar={recargarTodo}/>}
+        {view==="rrhh_emp"&&miEmpleado.esRRHH&&<RRHHEmpleados emps={emps} sols={sols} recargar={recargarTodo}/>}
+        {view==="rrhh_reg"&&miEmpleado.esRRHH&&<RRHHRegistrarVacacion emps={emps} sols={sols} recargar={recargarTodo}/>}
+        {view==="rrhh_sol"&&miEmpleado.esRRHH&&<RRHHSolicitudes sols={sols} recargar={recargarTodo}/>}
+        {view==="rrhh_fer"&&miEmpleado.esRRHH&&<RRHHFeriados/>}
+      </div>
+    </div>
+  );
+}
+
+const root=ReactDOM.createRoot(document.getElementById("root"));
+root.render(<AppMain/>);
+</script>
+
+<script>
+// Transformacion manual con Babel, forzando el runtime "classic" de JSX
+// (evita que Babel intente usar "import" internamente, lo cual falla fuera de un modulo)
+(function(){
+  var code = document.getElementById("app-source").textContent;
+  var output = Babel.transform(code, {
+    presets: [["react", {runtime: "classic"}]]
+  }).code;
+  var script = document.createElement("script");
+  script.textContent = output;
+  document.body.appendChild(script);
+})();
+</script>
+</body>
+</html>
