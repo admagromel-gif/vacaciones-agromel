@@ -56,6 +56,11 @@ const MODALIDADES = [
   {value:"MEDIA_TARDE", label:"Media tarde"},
   {value:"HORA",        label:"Por horas"},
 ];
+// NOTA: COLOR_DARK/COLOR_RED se definen aquí (y no más abajo) porque TIPO_CFG los usa
+// inmediatamente al cargar el script. Si se declaran después, JavaScript lanza
+// "Cannot access before initialization" y toda la app se rompe (pantalla en blanco).
+const COLOR_DARK="#1a1a1a";
+const COLOR_RED="#c0392b";
 const TIPO_CFG = {
   VACACION:     {icon:"🏖️",label:"Vacaciones",   sub:"Descuenta saldo",   color:COLOR_RED},
   COMPENSACION: {icon:"🔄",label:"Compensación", sub:"No descuenta saldo",color:"#b45309"},
@@ -155,6 +160,21 @@ function calcDiasAcumulados(fechaIngreso, fechaRef){
   }
   return total;
 }
+// Dado el ingreso del empleado y una fecha (ej. inicio de una vacación), devuelve
+// el "período" de trabajo al que pertenece esa fecha, en formato "2019 - 2020",
+// igual que en el sistema anterior (cada período va de aniversario a aniversario).
+function getPeriodoLabel(fechaIngreso, fechaRef){
+  if(!fechaIngreso||!fechaRef) return "";
+  const ini=new Date(fechaIngreso+"T00:00:00");
+  const ref=new Date(fechaRef+"T00:00:00");
+  if(isNaN(ini.getTime())||isNaN(ref.getTime())||ref<ini) return "";
+  let inicioPeriodo=new Date(ini);
+  while(true){
+    const finPeriodo=new Date(inicioPeriodo); finPeriodo.setFullYear(finPeriodo.getFullYear()+1);
+    if(ref<finPeriodo) return `${inicioPeriodo.getFullYear()} - ${finPeriodo.getFullYear()}`;
+    inicioPeriodo=finPeriodo;
+  }
+}
 function calcAntiguedadTxt(fechaIngreso, fechaRef){
   if(!fechaIngreso) return "";
   const ini=new Date(fechaIngreso+"T00:00:00");
@@ -248,8 +268,6 @@ const DB = {
 // ============================================================
 // ESTILOS COMUNES (paleta acorde al logo: negro + rojo)
 // ============================================================
-const COLOR_DARK="#1a1a1a";
-const COLOR_RED="#c0392b";
 const INP={width:"100%",border:"1.5px solid #d1d5db",borderRadius:"8px",padding:"9px 12px",fontSize:"14px",outline:"none",boxSizing:"border-box",fontFamily:"inherit"};
 const LBL={display:"block",fontSize:"13px",fontWeight:"600",color:"#374151",marginBottom:"5px"};
 const BTN_PRIMARY={backgroundColor:COLOR_RED,color:"white",padding:"11px 18px",borderRadius:"8px",border:"none",fontWeight:"700",fontSize:"14px",cursor:"pointer"};
@@ -320,7 +338,7 @@ function PrintForm({s}) {
           <td style={th2}>Total Dias Laborales</td><td style={th2}>Fecha de Retorno</td><td style={th2}>Días Pendientes</td>
         </tr>
         <tr>
-          <td style={td2}>{s.fechaInicio?s.fechaInicio.slice(0,4):""}</td>
+          <td style={td2}>{getPeriodoLabel(s.fechaIngreso,s.fechaInicio)}</td>
           <td style={td2}>{fmtD(s.fechaInicio)}</td>
           <td style={td2}>{fmtD(s.fechaFin)}</td>
           <td style={td2}>{s.diasEstimados}</td>
