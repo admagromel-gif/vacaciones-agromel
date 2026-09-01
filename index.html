@@ -1083,6 +1083,8 @@ function RRHHSolicitudes({sols, recargar}){
 function RRHHRegistrarVacacion({emps, sols, recargar}){
   const [empId,setEmpId]=useState("");
   const [tipo,setTipo]=useState("VACACION");
+  const [modalidad,setModalidad]=useState("DIA_COMPLETO");
+  const [horasPorDia,setHorasPorDia]=useState("1");
   const [fechaInicio,setFechaInicio]=useState("");
   const [fechaFin,setFechaFin]=useState("");
   const [observaciones,setObservaciones]=useState("");
@@ -1092,13 +1094,14 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
 
   const emp=emps.find(e=>e.id===empId);
   const saldoActual=emp?calcSaldoActual(emp,sols):0;
-  const diasCalc=(emp&&fechaInicio&&fechaFin)?calcDias(fechaInicio,fechaFin,"DIA_COMPLETO","1",[],emp.fechaNacimiento||null,emp.horarioSemana||"L-V"):{dias:0,feriadosEnRango:[],cumpleEnRango:null};
+  const diasCalc=(emp&&fechaInicio&&fechaFin)?calcDias(fechaInicio,fechaFin,modalidad,horasPorDia,[],emp.fechaNacimiento||null,emp.horarioSemana||"L-V"):{dias:0,feriadosEnRango:[],cumpleEnRango:null};
 
   const registrar=async()=>{
     setError(""); setMsg("");
     if(!emp){setError("Selecciona un empleado.");return;}
     if(!fechaInicio||!fechaFin){setError("Completa las fechas.");return;}
     if(fechaFin<fechaInicio){setError("La fecha fin no puede ser menor a la de inicio.");return;}
+    if(modalidad==="HORA"&&!(parseFloat(horasPorDia)>0)){setError("Ingresa las horas por día.");return;}
     setSaving(true);
     try{
       const jefe=emp.jefeCi?await DB.empGetByCi(emp.jefeCi):null;
@@ -1106,7 +1109,7 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
         numero:genNum(), empleadoCi:emp.ci, nombreEmpleado:emp.nombre, ci:emp.ci,
         cargo:emp.cargo, area:emp.area, sucursal:emp.sucursal||"", fechaIngreso:emp.fechaIngreso||"",
         codigo:emp.codigo||"", diasDisponibles:String(saldoActual),
-        tipo, modalidad:"DIA_COMPLETO", horasPorDia:"1",
+        tipo, modalidad, horasPorDia,
         fechaInicio, fechaFin, fechaRetorno:"",
         observaciones:observaciones||"Registrada por RRHH (vacación ya tomada).",
         diasEstimados:diasCalc.dias, feriadosEnRango:diasCalc.feriadosEnRango, cumpleEnRango:diasCalc.cumpleEnRango,
@@ -1116,7 +1119,7 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
       };
       await DB.solCreate(nueva);
       setMsg(`✅ Registrada: se descontaron ${diasCalc.dias} día(s) del saldo de ${emp.nombre}.`);
-      setEmpId(""); setFechaInicio(""); setFechaFin(""); setObservaciones("");
+      setEmpId(""); setFechaInicio(""); setFechaFin(""); setObservaciones(""); setModalidad("DIA_COMPLETO"); setHorasPorDia("1");
       recargar();
     }catch(e){ setError("No se pudo registrar. Intenta de nuevo."); }
     setSaving(false);
@@ -1145,13 +1148,174 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
             ))}
           </div>
         </div>
+        <div>
+          <label style={LBL}>Modalidad</label>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
+            {MODALIDADES.map(m=>(
+              <button key={m.value} onClick={()=>setModalidad(m.value)} style={{padding:"9px 12px",borderRadius:"8px",border:`1.5px solid ${modalidad===m.value?COLOR_RED:"#e5e7eb"}`,backgroundColor:modalidad===m.value?"#fef2f2":"white",color:modalidad===m.value?COLOR_RED:"#6b7280",fontWeight:modalidad===m.value?"700":"400",cursor:"pointer",fontSize:"13px"}}>{m.label}</button>
+            ))}
+          </div>
+          {modalidad==="HORA"&&<div style={{marginTop:"10px",display:"flex",alignItems:"center",gap:"10px"}}>
+            <label style={{...LBL,margin:0}}>Horas por día *</label>
+            <input type="number" min="0.5" max="8" step="0.5" style={{...INP,width:"80px"}} value={horasPorDia} onChange={e=>setHorasPorDia(e.target.value)}/>
+          </div>}
+        </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
           <div><label style={LBL}>Fecha inicio *</label><input type="date" style={INP} value={fechaInicio} onChange={e=>setFechaInicio(e.target.value)}/></div>
           <div><label style={LBL}>Fecha fin *</label><input type="date" style={INP} value={fechaFin} min={fechaInicio} onChange={e=>setFechaFin(e.target.value)}/></div>
         </div>
-        {emp&&fechaInicio&&fechaFin&&<div style={{padding:"8px 12px",backgroundColor:"#f9fafb",borderRadius:"8px",fontSize:"13px"}}>Días hábiles: <strong>{diasCalc.dias}</strong></div>}
+        {emp&&fechaInicio&&fechaFin&&<div style={{padding:"8px 12px",backgroundColor:"#f9fafb",borderRadius:"8px",fontSize:"13px"}}>Días {modalidad==="HORA"?"(equivalentes)":"hábiles"}: <strong>{diasCalc.dias}</strong></div>}
         <div><label style={LBL}>Observaciones (opcional)</label><textarea style={{...INP,minHeight:"60px",resize:"vertical"}} value={observaciones} onChange={e=>setObservaciones(e.target.value)}/></div>
         <button onClick={registrar} disabled={saving} style={{...BTN_PRIMARY,opacity:saving?0.6:1}}>{saving?"Registrando...":"✅ Registrar como Aprobada"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PANEL RRHH — SOLICITAR EN NOMBRE DE UN EMPLEADO (sin necesidad de cuenta)
+// ============================================================
+function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
+  const [empId,setEmpId]=useState("");
+  const [step,setStep]=useState("form");
+  const [solGuardada,setSolGuardada]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const [error,setError]=useState("");
+  const [feriadosVar,setFeriadosVar]=useState([]);
+  const [form,setForm]=useState({
+    tipo:"VACACION",modalidad:"DIA_COMPLETO",horasPorDia:"1",
+    fechaInicio:"",fechaFin:"",fechaRetorno:"",observaciones:""
+  });
+  const set=(k,v)=>setForm(p=>({...p,[k]:v}));
+  const emp=emps.find(e=>e.id===empId);
+
+  useEffect(()=>{
+    const yr=new Date().getFullYear();
+    Promise.all([DB.ferGet(yr),DB.ferGet(yr+1)]).then(([a,b])=>setFeriadosVar([...a,...b]));
+  },[]);
+
+  const calcResult=useMemo(()=>emp?calcDias(form.fechaInicio,form.fechaFin,form.modalidad,form.horasPorDia,feriadosVar,emp.fechaNacimiento||null,emp.horarioSemana||"L-V"):{dias:0,feriadosEnRango:[],cumpleEnRango:null},
+    [emp,form.fechaInicio,form.fechaFin,form.modalidad,form.horasPorDia,feriadosVar]);
+
+  const saldoActual=useMemo(()=>emp?calcSaldoActual(emp,sols):0,[emp,sols]);
+
+  const validar=()=>{
+    if(!emp) return "Selecciona un empleado.";
+    if(!form.fechaInicio) return "Selecciona la fecha de inicio.";
+    if(!form.fechaFin) return "Selecciona la fecha de fin.";
+    if(form.fechaFin<form.fechaInicio) return "La fecha fin no puede ser menor a la fecha inicio.";
+    if(form.modalidad==="HORA"&&!(parseFloat(form.horasPorDia)>0)) return "Ingresa las horas por día.";
+    return "";
+  };
+
+  const reset=()=>{setStep("form");setSolGuardada(null);setEmpId("");setForm({tipo:"VACACION",modalidad:"DIA_COMPLETO",horasPorDia:"1",fechaInicio:"",fechaFin:"",fechaRetorno:"",observaciones:""});};
+
+  const generar=async()=>{
+    const err=validar(); if(err){setError(err);return;}
+    setError(""); setSaving(true);
+    try{
+      const jefe=emp.jefeCi?await DB.empGetByCi(emp.jefeCi):null;
+      const nueva={
+        numero:genNum(), empleadoCi:emp.ci, nombreEmpleado:emp.nombre, ci:emp.ci,
+        cargo:emp.cargo, area:emp.area, sucursal:emp.sucursal||"", fechaIngreso:emp.fechaIngreso||"",
+        codigo:emp.codigo||"", diasDisponibles:String(saldoActual),
+        tipo:form.tipo, modalidad:form.modalidad, horasPorDia:form.horasPorDia,
+        fechaInicio:form.fechaInicio, fechaFin:form.fechaFin, fechaRetorno:form.fechaRetorno,
+        observaciones:form.observaciones, diasEstimados:calcResult.dias,
+        feriadosEnRango:calcResult.feriadosEnRango, cumpleEnRango:calcResult.cumpleEnRango,
+        estado:"Pendiente", jefeCi:emp.jefeCi||"", jefeNombre:jefe?jefe.nombre:"",
+        fechaSolicitud:new Date().toISOString(), creadaPorRRHH:true,
+      };
+      const id=await DB.solCreate(nueva);
+      setSolGuardada({...nueva,id}); setStep("preview");
+      recargar();
+    }catch(e){ setError("No se pudo guardar la solicitud. Intenta de nuevo."); }
+    setSaving(false);
+  };
+
+  if(step==="preview"&&solGuardada) return(
+    <div>
+      <div className="print-hidden" style={{display:"flex",gap:"10px",marginBottom:"14px",flexWrap:"wrap"}}>
+        <button onClick={()=>window.print()} style={BTN_PRIMARY}>🖨️ Imprimir formulario</button>
+        <button onClick={reset} style={BTN_SECONDARY}>Nueva solicitud</button>
+      </div>
+      <div className="print-hidden" style={{marginBottom:"12px",padding:"10px 14px",backgroundColor:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:"8px",color:"#166534",fontSize:"13px"}}>
+        ✅ Solicitud creada para {solGuardada.nombreEmpleado}{solGuardada.jefeNombre?` — pendiente de aprobación de ${solGuardada.jefeNombre}`:""}. Imprime el formulario para que lo firmen.
+      </div>
+      <PrintForm s={solGuardada}/>
+    </div>
+  );
+
+  const {dias:diasCalc,feriadosEnRango:fers,cumpleEnRango:cumple}=calcResult;
+  return(
+    <div style={{maxWidth:"640px",margin:"0 auto"}}>
+      <p style={{fontSize:"12px",color:"#9ca3af",marginBottom:"14px"}}>Úsalo cuando un empleado te pida hacer su solicitud pero no tiene (o no quiere crear) una cuenta en el sistema. La solicitud queda como Pendiente y sigue el flujo normal de aprobación con su jefe.</p>
+      <div style={CARD}>
+        <div style={{backgroundColor:COLOR_DARK,color:"white",padding:"20px 24px"}}>
+          <h2 style={{margin:0,fontSize:"18px",fontWeight:"700"}}>Nueva Solicitud (por RRHH)</h2>
+          <p style={{margin:"4px 0 0",fontSize:"13px",color:"#93c5fd"}}>{emp?`${emp.nombre} — ${emp.cargo}`:"Selecciona un empleado"}</p>
+        </div>
+        <div style={{padding:"24px",display:"flex",flexDirection:"column",gap:"20px"}}>
+          <div>
+            <label style={LBL}>Empleado *</label>
+            <select style={INP} value={empId} onChange={e=>setEmpId(e.target.value)}>
+              <option value="">— Selecciona —</option>
+              {emps.filter(e=>!e.cuentaAdmin).sort((a,b)=>a.nombre.localeCompare(b.nombre)).map(e=><option key={e.id} value={e.id}>{e.nombre} ({e.ci})</option>)}
+            </select>
+          </div>
+          {emp&&<div style={{padding:"10px 14px",backgroundColor:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:"8px",fontSize:"13px",color:"#1e40af"}}>
+            🏖️ Saldo actual disponible: <strong>{saldoActual} día(s)</strong>
+            {emp.jefeCi&&<div style={{marginTop:"2px"}}>La solicitud se enviará a su jefe inmediato para aprobación.</div>}
+            {!emp.jefeCi&&<div style={{marginTop:"2px",color:"#92400e"}}>⚠️ No tiene un jefe asignado. Configúralo en Empleados si quieres que pase por aprobación.</div>}
+          </div>}
+          <div>
+            <div style={LBL}>Tipo de solicitud</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px"}}>
+              {Object.entries(TIPO_CFG).map(([v,t])=>(
+                <button key={v} onClick={()=>set("tipo",v)} style={{padding:"12px",borderRadius:"10px",border:`2px solid ${form.tipo===v?COLOR_RED:"#e5e7eb"}`,backgroundColor:form.tipo===v?"#fef2f2":"white",cursor:"pointer",textAlign:"left"}}>
+                  <div style={{fontSize:"22px"}}>{t.icon}</div>
+                  <div style={{fontWeight:"700",fontSize:"13px",color:form.tipo===v?COLOR_RED:"#374151",marginTop:"4px"}}>{t.label}</div>
+                  <div style={{fontSize:"11px",color:"#9ca3af"}}>{t.sub}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div style={LBL}>Período solicitado</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
+              <div><label style={LBL}>Fecha inicio *</label><input type="date" style={INP} value={form.fechaInicio} onChange={e=>set("fechaInicio",e.target.value)}/></div>
+              <div><label style={LBL}>Fecha fin *</label><input type="date" style={INP} value={form.fechaFin} min={form.fechaInicio} onChange={e=>set("fechaFin",e.target.value)}/></div>
+              <div><label style={LBL}>Fecha retorno (opcional)</label><input type="date" style={INP} value={form.fechaRetorno} onChange={e=>set("fechaRetorno",e.target.value)}/></div>
+              <div><label style={LBL}>Días hábiles estimados</label><div style={{...INP,backgroundColor:"#f9fafb",color:diasCalc>0?COLOR_RED:"#9ca3af",fontWeight:"600"}}>{diasCalc>0?`${diasCalc} día(s)`:"—"}</div></div>
+            </div>
+            {(fers.length>0||cumple)&&(
+              <div style={{marginTop:"10px",display:"flex",flexDirection:"column",gap:"6px"}}>
+                {fers.length>0&&<div style={{padding:"8px 12px",backgroundColor:"#fff7ed",border:"1px solid #fed7aa",borderRadius:"8px",fontSize:"12px",color:"#9a3412"}}><strong>🏳️ Feriados excluidos:</strong> {fers.map(f=>`${fmtD(f.fecha)} (${f.desc})`).join(", ")}</div>}
+                {cumple&&<div style={{padding:"8px 12px",backgroundColor:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:"8px",fontSize:"12px",color:"#166534"}}>🎉 Cumpleaños el {fmtD(cumple)} — ½ día libre sin descontar.</div>}
+              </div>
+            )}
+            {emp&&form.tipo==="VACACION"&&diasCalc>saldoActual&&(
+              <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",fontSize:"12px",color:"#dc2626"}}>
+                ⚠️ Se están solicitando {diasCalc} día(s), pero el saldo disponible es de {saldoActual} día(s).
+              </div>
+            )}
+          </div>
+          <div>
+            <label style={LBL}>Modalidad</label>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
+              {MODALIDADES.map(m=>(
+                <button key={m.value} onClick={()=>set("modalidad",m.value)} style={{padding:"9px 12px",borderRadius:"8px",border:`1.5px solid ${form.modalidad===m.value?COLOR_RED:"#e5e7eb"}`,backgroundColor:form.modalidad===m.value?"#fef2f2":"white",color:form.modalidad===m.value?COLOR_RED:"#6b7280",fontWeight:form.modalidad===m.value?"700":"400",cursor:"pointer",fontSize:"13px"}}>{m.label}</button>
+              ))}
+            </div>
+            {form.modalidad==="HORA"&&<div style={{marginTop:"10px",display:"flex",alignItems:"center",gap:"10px"}}>
+              <label style={{...LBL,margin:0}}>Horas por día *</label>
+              <input type="number" min="0.5" max="8" step="0.5" style={{...INP,width:"80px"}} value={form.horasPorDia} onChange={e=>set("horasPorDia",e.target.value)}/>
+            </div>}
+          </div>
+          <div><label style={LBL}>Observaciones (opcional)</label><textarea style={{...INP,minHeight:"70px",resize:"vertical"}} value={form.observaciones} onChange={e=>set("observaciones",e.target.value)}/></div>
+          {error&&<div style={{padding:"10px 14px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",color:"#dc2626",fontSize:"13px"}}>⚠️ {error}</div>}
+          <button onClick={generar} disabled={saving} style={{...BTN_PRIMARY,width:"100%",padding:"13px",fontSize:"15px",opacity:saving?0.6:1}}>{saving?"Generando...":"✅ Generar y enviar formulario"}</button>
+        </div>
       </div>
     </div>
   );
@@ -1309,7 +1473,7 @@ function AppMain(){
   const TABS=[
     ...(esCuentaAdmin?[]:[{id:"solicitar",label:"🏖️ Solicitar"},{id:"mis_sol",label:"📄 Mis Solicitudes"}]),
     ...(!esCuentaAdmin&&tieneEquipo?[{id:"aprobaciones",label:"✅ Aprobaciones"}]:[]),
-    ...(miEmpleado.esRRHH?[{id:"rrhh_emp",label:"👥 Empleados"},{id:"rrhh_reg",label:"➕ Registrar Vacación"},{id:"rrhh_sol",label:"📋 Solicitudes"},{id:"rrhh_fer",label:"🏳️ Feriados"}]:[]),
+    ...(miEmpleado.esRRHH?[{id:"rrhh_emp",label:"👥 Empleados"},{id:"rrhh_sol_por_emp",label:"📝 Solicitar por Empleado"},{id:"rrhh_reg",label:"➕ Registrar Vacación"},{id:"rrhh_sol",label:"📋 Solicitudes"},{id:"rrhh_fer",label:"🏳️ Feriados"}]:[]),
   ];
 
   return(
@@ -1333,6 +1497,7 @@ function AppMain(){
         {view==="mis_sol"&&<MisSolicitudesView miEmpleado={miEmpleado} sols={sols} recargar={recargarTodo}/>}
         {view==="aprobaciones"&&tieneEquipo&&<AprobacionesView miEmpleado={miEmpleado} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_emp"&&miEmpleado.esRRHH&&<RRHHEmpleados emps={emps} sols={sols} recargar={recargarTodo}/>}
+        {view==="rrhh_sol_por_emp"&&miEmpleado.esRRHH&&<RRHHSolicitarPorEmpleado emps={emps} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_reg"&&miEmpleado.esRRHH&&<RRHHRegistrarVacacion emps={emps} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_sol"&&miEmpleado.esRRHH&&<RRHHSolicitudes sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_fer"&&miEmpleado.esRRHH&&<RRHHFeriados/>}
