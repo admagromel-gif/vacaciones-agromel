@@ -185,6 +185,81 @@ function calcSaldoActual(emp, sols, fechaRef){
   return Math.round((base+acumuladoDesdeCorte-usadoDesdeCorte)*10)/10;
 }
 
+// ------------------------------------------------------------
+// Desglose por gestión/periodo de vacación (aniversario a aniversario
+// de la fecha de ingreso). Cada periodo otorga los días de Ley
+// correspondientes (diasPorAnioCumplido) y se consumen en orden,
+// del periodo más antiguo con saldo hacia el más nuevo (FIFO), para
+// saber de qué gestión(es) se están descontando los días de una
+// solicitud — igual que en el formulario impreso en papel.
+// ------------------------------------------------------------
+function calcPeriodos(emp, sols, fechaRef){
+  if(!emp||!emp.fechaIngreso) return [];
+  const ref=fechaRef||hoyISO();
+  const ini=new Date(emp.fechaIngreso+"T00:00:00");
+  const refD=new Date(ref+"T00:00:00");
+  if(isNaN(ini.getTime())||refD<=ini) return [];
+  const corte=emp.fechaCorteSaldo||ref;
+  const base=parseFloat(emp.diasDisponibles)||0;
+
+  const periodos=[];
+  let cursor=new Date(ini), anioNum=1;
+  while(true){
+    const fin=new Date(cursor); fin.setFullYear(fin.getFullYear()+1);
+    if(fin>refD) break;
+    periodos.push({
+      inicio:cursor.toISOString().slice(0,10), fin:fin.toISOString().slice(0,10),
+      label:`${cursor.getFullYear()}-${fin.getFullYear()}`,
+      diasTotal:diasPorAnioCumplido(anioNum), diasUsados:0,
+    });
+    cursor=fin; anioNum++;
+  }
+  if(!periodos.length) return [];
+
+  // Lo usado antes del corte se asume consumido desde el periodo mas antiguo,
+  // dejando el remanente (base) concentrado en los periodos mas recientes previos al corte.
+  const corteD=new Date(corte+"T00:00:00");
+  let usadoPreCorte=Math.max(0, calcDiasAcumulados(emp.fechaIngreso,corte)-base);
+  for(const p of periodos){
+    if(usadoPreCorte<=0) break;
+    if(new Date(p.fin+"T00:00:00")<=corteD){
+      const usar=Math.min(usadoPreCorte,p.diasTotal);
+      p.diasUsados=usar; usadoPreCorte-=usar;
+    }
+  }
+  // Solicitudes aprobadas desde el corte, en orden cronologico, consumen FIFO
+  const usos=(sols||[])
+    .filter(s=>s.ci&&emp.ci&&s.ci===emp.ci&&s.estado==="Aprobada"&&s.tipo!=="COMPENSACION"&&s.fechaInicio&&s.fechaInicio>=corte)
+    .sort((a,b)=>a.fechaInicio.localeCompare(b.fechaInicio));
+  for(const u of usos){
+    let restante=parseFloat(u.diasEstimados)||0;
+    for(const p of periodos){
+      if(restante<=0) break;
+      const disponible=p.diasTotal-p.diasUsados;
+      if(disponible<=0) continue;
+      const usar=Math.min(disponible,restante);
+      p.diasUsados+=usar; restante-=usar;
+    }
+  }
+  return periodos.map(p=>({...p,diasUsados:Math.round(p.diasUsados*10)/10,diasRestante:Math.round((p.diasTotal-p.diasUsados)*10)/10}));
+}
+
+// Simula de que periodo(s) se descontarian "diasSolicitados" dias adicionales,
+// a partir del saldo por periodo ya existente (sin registrar nada todavia).
+function calcDesglosePeriodos(emp, sols, diasSolicitados, fechaRef){
+  const periodos=calcPeriodos(emp,sols,fechaRef);
+  let restante=Math.round((parseFloat(diasSolicitados)||0)*10)/10;
+  const desglose=[];
+  for(const p of periodos){
+    if(restante<=0) break;
+    if(p.diasRestante<=0) continue;
+    const usar=Math.min(p.diasRestante,restante);
+    if(usar>0){ desglose.push({label:p.label,dias:Math.round(usar*10)/10}); restante-=usar; }
+  }
+  if(restante>0.001) desglose.push({label:"Sin periodo asignado",dias:Math.round(restante*10)/10});
+  return desglose;
+}
+
 // ============================================================
 // CAPA DE DATOS (Firestore)
 // ============================================================
@@ -320,7 +395,9 @@ function PrintForm({s}) {
           <td style={th2}>Total Dias Laborales</td><td style={th2}>Fecha de Retorno</td><td style={th2}>Días Pendientes</td>
         </tr>
         <tr>
-          <td style={td2}>{s.fechaInicio?s.fechaInicio.slice(0,4):""}</td>
+          <td style={td2}>{s.periodosDesglose&&s.periodosDesglose.length?s.periodosDesglose.map((p,i)=>(
+            <div key={i} style={{lineHeight:"1.4"}}>{p.label}{p.dias!==undefined?`: ${fmtNum(p.dias)} día(s)`:""}</div>
+          )):(s.fechaInicio?s.fechaInicio.slice(0,4):"")}</td>
           <td style={td2}>{fmtD(s.fechaInicio)}</td>
           <td style={td2}>{fmtD(s.fechaFin)}</td>
           <td style={td2}>{s.diasEstimados}</td>
@@ -505,6 +582,8 @@ function SolicitarView({miEmpleado, sols, recargar}){
     [form.fechaInicio,form.fechaFin,form.modalidad,form.horasPorDia,feriadosVar,miEmpleado.fechaNacimiento,miEmpleado.horarioSemana]);
 
   const saldoActual=useMemo(()=>calcSaldoActual(miEmpleado,sols),[miEmpleado,sols]);
+  const desglosePeriodos=useMemo(()=>(form.tipo==="VACACION"&&calcResult.dias>0)?calcDesglosePeriodos(miEmpleado,sols,calcResult.dias,hoyISO()):[],
+    [miEmpleado,sols,form.tipo,calcResult.dias]);
 
   const validar=()=>{
     if(!form.fechaInicio) return "Selecciona la fecha de inicio.";
@@ -527,13 +606,14 @@ function SolicitarView({miEmpleado, sols, recargar}){
         fechaInicio:form.fechaInicio, fechaFin:form.fechaFin, fechaRetorno:form.fechaRetorno,
         observaciones:form.observaciones, diasEstimados:calcResult.dias,
         feriadosEnRango:calcResult.feriadosEnRango, cumpleEnRango:calcResult.cumpleEnRango,
+        periodosDesglose:form.tipo==="VACACION"?desglosePeriodos:[],
         estado:"Pendiente", jefeCi:miEmpleado.jefeCi||"", jefeNombre:jefe?jefe.nombre:"",
         fechaSolicitud:new Date().toISOString(),
       };
       const id=await DB.solCreate(nueva);
       setSolGuardada({...nueva,id}); setStep("preview");
       recargar();
-    }catch(e){ setError("No se pudo guardar la solicitud. Intenta de nuevo."); }
+    }catch(e){ console.error("Error al generar solicitud:",e); setError(`No se pudo guardar la solicitud: ${e.message||"error desconocido"}.`); }
     setSaving(false);
   };
 
@@ -593,6 +673,11 @@ function SolicitarView({miEmpleado, sols, recargar}){
             {form.tipo==="VACACION"&&diasCalc>saldoActual&&(
               <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",fontSize:"12px",color:"#dc2626"}}>
                 ⚠️ Estás solicitando {diasCalc} día(s), pero tu saldo disponible es de {saldoActual} día(s). Igual puedes enviarla, pero tu jefe verá esta misma advertencia al revisarla.
+              </div>
+            )}
+            {form.tipo==="VACACION"&&desglosePeriodos.length>0&&(
+              <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:"8px",fontSize:"12px",color:"#374151"}}>
+                <strong>📅 Se descontará de la(s) gestión(es):</strong> {desglosePeriodos.map(p=>`${p.label} (${p.dias} día${p.dias!==1?"s":""})`).join(", ")}
               </div>
             )}
           </div>
@@ -773,9 +858,11 @@ function RRHHEmpleados({emps, sols, recargar}){
   const [form,setForm]=useState(DEFAULT_EMP);
   const [editing,setEditing]=useState(false);
   const [msg,setMsg]=useState("");
+  const [saving,setSaving]=useState(false);
   const [importText,setImportText]=useState("");
   const [showImport,setShowImport]=useState(false);
   const [confirmDelId,setConfirmDelId]=useState("");
+  const [verPeriodosId,setVerPeriodosId]=useState("");
   const [busqueda,setBusqueda]=useState("");
   const [filtroArea,setFiltroArea]=useState("");
   const [filtroSucursal,setFiltroSucursal]=useState("");
@@ -802,12 +889,21 @@ function RRHHEmpleados({emps, sols, recargar}){
 
   const guardar=async()=>{
     if(!form.nombre.trim()){setMsg("⚠️ El nombre es obligatorio.");return;}
-    const nuevo={...form,fechaCorteSaldo:hoyISO()};
-    await DB.empSave(nuevo);
-    if(nuevo.uid) await DB.roleSet(nuevo.uid,nuevo.esRRHH);
-    setForm(DEFAULT_EMP); setEditing(false);
-    setMsg("✅ Empleado guardado."); setTimeout(()=>setMsg(""),3000);
-    recargar();
+    if(saving) return;
+    setSaving(true); setMsg("");
+    try{
+      const {id,...datos}=form;
+      const nuevo=id?{id,...datos,fechaCorteSaldo:hoyISO()}:{...datos,fechaCorteSaldo:hoyISO()};
+      const nuevoId=await DB.empSave(nuevo);
+      if(nuevo.uid) await DB.roleSet(nuevo.uid,nuevo.esRRHH);
+      setForm(DEFAULT_EMP); setEditing(false);
+      setMsg("✅ Empleado guardado."); setTimeout(()=>setMsg(""),3000);
+      recargar();
+    }catch(e){
+      console.error("Error al guardar empleado:",e);
+      setMsg(`⚠️ No se pudo guardar: ${e.message||"error desconocido"}. Revisa tu conexión o los permisos de la base de datos.`);
+    }
+    setSaving(false);
   };
   const editar=e=>{
     const saldoHoy=calcSaldoActual(e,sols);
@@ -815,9 +911,14 @@ function RRHHEmpleados({emps, sols, recargar}){
     setEditing(true);
   };
   const eliminar=async id=>{
-    await DB.empDelete(id); setConfirmDelId("");
-    setMsg("🗑️ Empleado eliminado."); setTimeout(()=>setMsg(""),3000);
-    recargar();
+    try{
+      await DB.empDelete(id); setConfirmDelId("");
+      setMsg("🗑️ Empleado eliminado."); setTimeout(()=>setMsg(""),3000);
+      recargar();
+    }catch(e){
+      console.error("Error al eliminar empleado:",e);
+      setMsg(`⚠️ No se pudo eliminar: ${e.message||"error desconocido"}.`);
+    }
   };
   const importarCSV=async()=>{
     const lineas=importText.trim().split("\n").filter(l=>l.trim());
@@ -825,25 +926,30 @@ function RRHHEmpleados({emps, sols, recargar}){
     let inicio=0;
     if(lineas[0].toLowerCase().replace(/"/g,"").trim().startsWith("nombre")) inicio=1;
     let creados=0, actualizados=0;
-    for(let i=inicio;i<lineas.length;i++){
-      const cols=lineas[i].split(",").map(c=>c.trim().replace(/"/g,""));
-      if(!cols[0]) continue;
-      const ci=cols[1]||"";
-      const datosNuevo={nombre:cols[0]||"",ci,cargo:cols[2]||"",area:cols[3]||"",fechaNacimiento:cols[4]||"",
-        sucursal:cols[5]||"",fechaIngreso:cols[6]||"",codigo:cols[7]||"",diasDisponibles:cols[8]||"",horarioSemana:cols[9]||""};
-      const existente=ci?emps.find(x=>x.ci===ci):null;
-      if(existente){
-        const merged={};
-        Object.keys(datosNuevo).forEach(k=>{ if(datosNuevo[k]!=="") merged[k]=datosNuevo[k]; });
-        if(datosNuevo.diasDisponibles!=="") merged.fechaCorteSaldo=hoyISO();
-        await DB.empSave({id:existente.id,...merged}); actualizados++;
-      } else {
-        await DB.empSave({area:AREAS[0],sucursal:SUCURSALES[0],fechaCorteSaldo:hoyISO(),jefeCi:"",esRRHH:false,cuentaAdmin:false,horarioSemana:"L-V",...datosNuevo}); creados++;
+    try{
+      for(let i=inicio;i<lineas.length;i++){
+        const cols=lineas[i].split(",").map(c=>c.trim().replace(/"/g,""));
+        if(!cols[0]) continue;
+        const ci=cols[1]||"";
+        const datosNuevo={nombre:cols[0]||"",ci,cargo:cols[2]||"",area:cols[3]||"",fechaNacimiento:cols[4]||"",
+          sucursal:cols[5]||"",fechaIngreso:cols[6]||"",codigo:cols[7]||"",diasDisponibles:cols[8]||"",horarioSemana:cols[9]||""};
+        const existente=ci?emps.find(x=>x.ci===ci):null;
+        if(existente){
+          const merged={};
+          Object.keys(datosNuevo).forEach(k=>{ if(datosNuevo[k]!=="") merged[k]=datosNuevo[k]; });
+          if(datosNuevo.diasDisponibles!=="") merged.fechaCorteSaldo=hoyISO();
+          await DB.empSave({id:existente.id,...merged}); actualizados++;
+        } else {
+          await DB.empSave({area:AREAS[0],sucursal:SUCURSALES[0],fechaCorteSaldo:hoyISO(),jefeCi:"",esRRHH:false,cuentaAdmin:false,horarioSemana:"L-V",...datosNuevo}); creados++;
+        }
       }
+      setImportText(""); setShowImport(false);
+      setMsg(`✅ ${creados} nuevo(s), ${actualizados} actualizado(s).`); setTimeout(()=>setMsg(""),5000);
+      recargar();
+    }catch(e){
+      console.error("Error al importar CSV:",e);
+      setMsg(`⚠️ Error durante la importación (${creados} nuevo(s) y ${actualizados} actualizado(s) antes de fallar): ${e.message||"error desconocido"}.`);
     }
-    setImportText(""); setShowImport(false);
-    setMsg(`✅ ${creados} nuevo(s), ${actualizados} actualizado(s).`); setTimeout(()=>setMsg(""),5000);
-    recargar();
   };
 
   const exportarCSV=()=>{
@@ -957,15 +1063,16 @@ function RRHHEmpleados({emps, sols, recargar}){
             </div>
           </div>
           <div style={{display:"flex",gap:"8px",marginTop:"12px"}}>
-            <button onClick={guardar} style={BTN_PRIMARY}>💾 Guardar</button>
-            <button onClick={()=>{setEditing(false);setForm(DEFAULT_EMP);}} style={BTN_SECONDARY}>Cancelar</button>
+            <button onClick={guardar} disabled={saving} style={{...BTN_PRIMARY,opacity:saving?0.6:1}}>{saving?"Guardando...":"💾 Guardar"}</button>
+            <button onClick={()=>{setEditing(false);setForm(DEFAULT_EMP);setMsg("");}} style={BTN_SECONDARY}>Cancelar</button>
           </div>
         </div>
       )}
       {empsFiltrados.length===0?<div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}>{emps.length===0?"No hay empleados aún.":"No se encontraron empleados con esa búsqueda."}</div>:
       <div style={{display:"flex",flexDirection:"column",gap:"6px"}}>
         {empsFiltrados.map(e=>(
-          <div key={e.id} style={{backgroundColor:"white",borderRadius:"8px",padding:"12px 16px",border:"1px solid #e5e7eb",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div key={e.id} style={{backgroundColor:"white",borderRadius:"8px",border:"1px solid #e5e7eb",overflow:"hidden"}}>
+          <div style={{padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div>
               <div style={{fontWeight:"600",fontSize:"14px"}}>{e.nombre} {e.esRRHH&&<span style={{fontSize:"10px",backgroundColor:"#eff6ff",color:"#1e40af",padding:"1px 6px",borderRadius:"8px",marginLeft:"6px"}}>RRHH</span>} {e.cuentaAdmin&&<span style={{fontSize:"10px",backgroundColor:"#fdf4ff",color:"#86198f",padding:"1px 6px",borderRadius:"8px",marginLeft:"6px"}}>CUENTA ADMIN (sin vacaciones)</span>}</div>
               <div style={{fontSize:"12px",color:"#9ca3af",marginTop:"2px"}}>
@@ -982,11 +1089,34 @@ function RRHHEmpleados({emps, sols, recargar}){
                 </>
               ):(
                 <>
+                  {e.fechaIngreso&&<button onClick={()=>setVerPeriodosId(p=>p===e.id?"":e.id)} style={{padding:"5px 10px",borderRadius:"6px",border:"1.5px solid #e5e7eb",backgroundColor:verPeriodosId===e.id?"#f9fafb":"white",cursor:"pointer",fontSize:"12px"}}>📅 Gestiones</button>}
                   <button onClick={()=>editar(e)} style={{padding:"5px 10px",borderRadius:"6px",border:"1.5px solid #e5e7eb",backgroundColor:"white",cursor:"pointer",fontSize:"12px"}}>✏️</button>
                   <button onClick={()=>setConfirmDelId(e.id)} style={{padding:"5px 10px",borderRadius:"6px",border:"none",backgroundColor:"#fef2f2",color:"#dc2626",cursor:"pointer",fontSize:"12px"}}>🗑️</button>
                 </>
               )}
             </div>
+          </div>
+          {verPeriodosId===e.id&&(()=>{
+            const periodos=calcPeriodos(e,sols,hoyISO());
+            return(
+              <div style={{padding:"10px 16px 14px",borderTop:"1px solid #e5e7eb",backgroundColor:"#f9fafb"}}>
+                {periodos.length===0?<div style={{fontSize:"12px",color:"#9ca3af"}}>Aún no completa su primera gestión (1 año desde su ingreso).</div>:
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:"12px"}}><tbody>
+                  <tr style={{color:"#6b7280",textAlign:"left"}}>
+                    <td style={{padding:"3px 6px"}}>Gestión</td><td style={{padding:"3px 6px"}}>Días de Ley</td><td style={{padding:"3px 6px"}}>Usados</td><td style={{padding:"3px 6px"}}>Saldo</td>
+                  </tr>
+                  {periodos.map((p,i)=>(
+                    <tr key={i} style={{borderTop:"1px solid #e5e7eb"}}>
+                      <td style={{padding:"4px 6px",fontWeight:"600"}}>{p.label}</td>
+                      <td style={{padding:"4px 6px"}}>{p.diasTotal}</td>
+                      <td style={{padding:"4px 6px"}}>{p.diasUsados}</td>
+                      <td style={{padding:"4px 6px",color:p.diasRestante>0?COLOR_RED:"#9ca3af",fontWeight:"600"}}>{p.diasRestante}</td>
+                    </tr>
+                  ))}
+                </tbody></table>}
+              </div>
+            );
+          })()}
           </div>
         ))}
       </div>}
@@ -1095,6 +1225,7 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
   const emp=emps.find(e=>e.id===empId);
   const saldoActual=emp?calcSaldoActual(emp,sols):0;
   const diasCalc=(emp&&fechaInicio&&fechaFin)?calcDias(fechaInicio,fechaFin,modalidad,horasPorDia,[],emp.fechaNacimiento||null,emp.horarioSemana||"L-V"):{dias:0,feriadosEnRango:[],cumpleEnRango:null};
+  const desglosePeriodos=(emp&&tipo==="VACACION"&&fechaInicio&&diasCalc.dias>0)?calcDesglosePeriodos(emp,sols,diasCalc.dias,fechaInicio):[];
 
   const registrar=async()=>{
     setError(""); setMsg("");
@@ -1113,6 +1244,7 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
         fechaInicio, fechaFin, fechaRetorno:"",
         observaciones:observaciones||"Registrada por RRHH (vacación ya tomada).",
         diasEstimados:diasCalc.dias, feriadosEnRango:diasCalc.feriadosEnRango, cumpleEnRango:diasCalc.cumpleEnRango,
+        periodosDesglose:tipo==="VACACION"?desglosePeriodos:[],
         estado:"Aprobada", jefeCi:emp.jefeCi||"", jefeNombre:jefe?jefe.nombre:"",
         fechaSolicitud:new Date().toISOString(), fechaResolucion:new Date().toISOString(),
         registradaPorRRHH:true,
@@ -1121,7 +1253,7 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
       setMsg(`✅ Registrada: se descontaron ${diasCalc.dias} día(s) del saldo de ${emp.nombre}.`);
       setEmpId(""); setFechaInicio(""); setFechaFin(""); setObservaciones(""); setModalidad("DIA_COMPLETO"); setHorasPorDia("1");
       recargar();
-    }catch(e){ setError("No se pudo registrar. Intenta de nuevo."); }
+    }catch(e){ console.error("Error al registrar vacación:",e); setError(`No se pudo registrar: ${e.message||"error desconocido"}.`); }
     setSaving(false);
   };
 
@@ -1165,6 +1297,11 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
           <div><label style={LBL}>Fecha fin *</label><input type="date" style={INP} value={fechaFin} min={fechaInicio} onChange={e=>setFechaFin(e.target.value)}/></div>
         </div>
         {emp&&fechaInicio&&fechaFin&&<div style={{padding:"8px 12px",backgroundColor:"#f9fafb",borderRadius:"8px",fontSize:"13px"}}>Días {modalidad==="HORA"?"(equivalentes)":"hábiles"}: <strong>{diasCalc.dias}</strong></div>}
+        {tipo==="VACACION"&&desglosePeriodos.length>0&&(
+          <div style={{padding:"8px 12px",backgroundColor:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:"8px",fontSize:"12px",color:"#374151"}}>
+            <strong>📅 Se descontará de la(s) gestión(es):</strong> {desglosePeriodos.map(p=>`${p.label} (${p.dias} día${p.dias!==1?"s":""})`).join(", ")}
+          </div>
+        )}
         <div><label style={LBL}>Observaciones (opcional)</label><textarea style={{...INP,minHeight:"60px",resize:"vertical"}} value={observaciones} onChange={e=>setObservaciones(e.target.value)}/></div>
         <button onClick={registrar} disabled={saving} style={{...BTN_PRIMARY,opacity:saving?0.6:1}}>{saving?"Registrando...":"✅ Registrar como Aprobada"}</button>
       </div>
@@ -1198,6 +1335,8 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
     [emp,form.fechaInicio,form.fechaFin,form.modalidad,form.horasPorDia,feriadosVar]);
 
   const saldoActual=useMemo(()=>emp?calcSaldoActual(emp,sols):0,[emp,sols]);
+  const desglosePeriodos=useMemo(()=>(emp&&form.tipo==="VACACION"&&calcResult.dias>0)?calcDesglosePeriodos(emp,sols,calcResult.dias,hoyISO()):[],
+    [emp,sols,form.tipo,calcResult.dias]);
 
   const validar=()=>{
     if(!emp) return "Selecciona un empleado.";
@@ -1223,13 +1362,14 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
         fechaInicio:form.fechaInicio, fechaFin:form.fechaFin, fechaRetorno:form.fechaRetorno,
         observaciones:form.observaciones, diasEstimados:calcResult.dias,
         feriadosEnRango:calcResult.feriadosEnRango, cumpleEnRango:calcResult.cumpleEnRango,
+        periodosDesglose:form.tipo==="VACACION"?desglosePeriodos:[],
         estado:"Pendiente", jefeCi:emp.jefeCi||"", jefeNombre:jefe?jefe.nombre:"",
         fechaSolicitud:new Date().toISOString(), creadaPorRRHH:true,
       };
       const id=await DB.solCreate(nueva);
       setSolGuardada({...nueva,id}); setStep("preview");
       recargar();
-    }catch(e){ setError("No se pudo guardar la solicitud. Intenta de nuevo."); }
+    }catch(e){ console.error("Error al generar solicitud:",e); setError(`No se pudo guardar la solicitud: ${e.message||"error desconocido"}.`); }
     setSaving(false);
   };
 
@@ -1297,6 +1437,11 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
             {emp&&form.tipo==="VACACION"&&diasCalc>saldoActual&&(
               <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",fontSize:"12px",color:"#dc2626"}}>
                 ⚠️ Se están solicitando {diasCalc} día(s), pero el saldo disponible es de {saldoActual} día(s).
+              </div>
+            )}
+            {form.tipo==="VACACION"&&desglosePeriodos.length>0&&(
+              <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:"8px",fontSize:"12px",color:"#374151"}}>
+                <strong>📅 Se descontará de la(s) gestión(es):</strong> {desglosePeriodos.map(p=>`${p.label} (${p.dias} día${p.dias!==1?"s":""})`).join(", ")}
               </div>
             )}
           </div>
