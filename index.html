@@ -314,11 +314,19 @@ const DB = {
   async loginIndexSet(ci,email){
     await window.__fbDb.collection("login_index").doc(ci).set({email});
   },
+  async loginIndexDelete(ci){
+    if(!ci) return;
+    await window.__fbDb.collection("login_index").doc(ci).delete().catch(()=>{});
+  },
   // Espejo minimo uid -> rol, usado por las reglas de seguridad de Firestore para verificar quien es RRHH
   // sin exponer el resto de los datos del empleado. Se actualiza cada vez que se guarda un empleado con uid.
   async roleSet(uid,esRRHH){
     if(!uid) return;
     await window.__fbDb.collection("roles").doc(uid).set({esRRHH:!!esRRHH});
+  },
+  async roleDelete(uid){
+    if(!uid) return;
+    await window.__fbDb.collection("roles").doc(uid).delete().catch(()=>{});
   },
 };
 
@@ -709,12 +717,47 @@ function MisSolicitudesView({miEmpleado, sols, recargar}){
   const [sel,setSel]=useState(null);
   const [showPrint,setShowPrint]=useState(false);
   const [confirmDel,setConfirmDel]=useState(false);
+  const [editando,setEditando]=useState(false);
+  const [feriadosVar,setFeriadosVar]=useState([]);
+  const [editForm,setEditForm]=useState(null);
+  const [errorEdit,setErrorEdit]=useState("");
+  const [savingEdit,setSavingEdit]=useState(false);
   const misSolicitudes=sols.filter(s=>s.ci===miEmpleado.ci).sort((a,b)=>(b.fechaSolicitud||"").localeCompare(a.fechaSolicitud||""));
+
+  useEffect(()=>{
+    const yr=new Date().getFullYear();
+    Promise.all([DB.ferGet(yr),DB.ferGet(yr+1)]).then(([a,b])=>setFeriadosVar([...a,...b]));
+  },[]);
 
   const eliminar=async s=>{
     await DB.solDelete(s.id);
     setConfirmDel(false); setSel(null);
     recargar();
+  };
+
+  const empezarEditar=s=>{
+    setEditForm({tipo:s.tipo,modalidad:s.modalidad,horasPorDia:s.horasPorDia||"1",fechaInicio:s.fechaInicio,fechaFin:s.fechaFin,fechaRetorno:s.fechaRetorno||"",observaciones:s.observaciones||""});
+    setEditando(true); setErrorEdit("");
+  };
+
+  const guardarEdicion=async()=>{
+    setErrorEdit("");
+    if(!editForm.fechaInicio||!editForm.fechaFin){setErrorEdit("Completa las fechas.");return;}
+    if(editForm.fechaFin<editForm.fechaInicio){setErrorEdit("La fecha fin no puede ser menor a la de inicio.");return;}
+    setSavingEdit(true);
+    try{
+      const calc=calcDias(editForm.fechaInicio,editForm.fechaFin,editForm.modalidad,editForm.horasPorDia,feriadosVar,miEmpleado.fechaNacimiento||null,miEmpleado.horarioSemana||"L-V");
+      const desglose=(editForm.tipo==="VACACION"&&calc.dias>0)?calcDesglosePeriodos(miEmpleado,sols,calc.dias,hoyISO()):[];
+      await DB.solUpdate(sel.id,{
+        tipo:editForm.tipo,modalidad:editForm.modalidad,horasPorDia:editForm.horasPorDia,
+        fechaInicio:editForm.fechaInicio,fechaFin:editForm.fechaFin,fechaRetorno:editForm.fechaRetorno,
+        observaciones:editForm.observaciones,diasEstimados:calc.dias,feriadosEnRango:calc.feriadosEnRango,
+        cumpleEnRango:calc.cumpleEnRango,periodosDesglose:desglose,
+      });
+      setEditando(false); setSel(null);
+      recargar();
+    }catch(e){ setErrorEdit("No se pudo guardar. Intenta de nuevo."); }
+    setSavingEdit(false);
   };
 
   if(!misSolicitudes.length) return <div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}><div style={{fontSize:"36px",marginBottom:"8px"}}>📭</div><p>Todavía no has generado ninguna solicitud.</p></div>;
@@ -728,6 +771,35 @@ function MisSolicitudesView({miEmpleado, sols, recargar}){
       <PrintForm s={sel}/>
     </div>
   );
+
+  if(sel&&editando&&editForm){
+    return(
+      <div>
+        <button onClick={()=>setEditando(false)} style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer",fontSize:"14px"}}>← Cancelar edición</button>
+        <div style={{...CARD,maxWidth:"560px",padding:"24px"}}>
+          <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"14px"}}>Editar solicitud N° {sel.numero}</div>
+          {errorEdit&&<div style={{padding:"10px 14px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",color:"#dc2626",fontSize:"13px",marginBottom:"12px"}}>⚠️ {errorEdit}</div>}
+          <div style={{display:"flex",flexDirection:"column",gap:"12px"}}>
+            <div>
+              <label style={LBL}>Tipo</label>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
+                {Object.entries(TIPO_CFG).map(([v,t])=>(
+                  <button key={v} onClick={()=>setEditForm(p=>({...p,tipo:v}))} style={{padding:"9px 12px",borderRadius:"8px",border:`1.5px solid ${editForm.tipo===v?COLOR_RED:"#e5e7eb"}`,backgroundColor:editForm.tipo===v?"#fef2f2":"white",color:editForm.tipo===v?COLOR_RED:"#6b7280",cursor:"pointer",fontSize:"13px"}}>{t.icon} {t.label}</button>
+                ))}
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
+              <div><label style={LBL}>Fecha inicio</label><input type="date" style={INP} value={editForm.fechaInicio} onChange={e=>setEditForm(p=>({...p,fechaInicio:e.target.value}))}/></div>
+              <div><label style={LBL}>Fecha fin</label><input type="date" style={INP} value={editForm.fechaFin} min={editForm.fechaInicio} onChange={e=>setEditForm(p=>({...p,fechaFin:e.target.value}))}/></div>
+            </div>
+            <div><label style={LBL}>Fecha retorno (opcional)</label><input type="date" style={INP} value={editForm.fechaRetorno} onChange={e=>setEditForm(p=>({...p,fechaRetorno:e.target.value}))}/></div>
+            <div><label style={LBL}>Observaciones</label><textarea style={{...INP,minHeight:"60px",resize:"vertical"}} value={editForm.observaciones} onChange={e=>setEditForm(p=>({...p,observaciones:e.target.value}))}/></div>
+            <button onClick={guardarEdicion} disabled={savingEdit} style={{...BTN_PRIMARY,opacity:savingEdit?0.6:1}}>{savingEdit?"Guardando...":"💾 Guardar cambios"}</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if(sel){
     const c=EC[sel.estado]||EC.Pendiente;
@@ -748,6 +820,7 @@ function MisSolicitudesView({miEmpleado, sols, recargar}){
             </div>
             <div style={{display:"flex",gap:"8px",marginTop:"20px",flexWrap:"wrap"}}>
               <button onClick={()=>setShowPrint(true)} style={BTN_SECONDARY}>🖨️ Ver / Imprimir formulario</button>
+              {sel.estado==="Pendiente"&&<button onClick={()=>empezarEditar(sel)} style={BTN_SECONDARY}>✏️ Editar</button>}
               {sel.estado==="Pendiente"&&!confirmDel&&<button onClick={()=>setConfirmDel(true)} style={{...BTN_SECONDARY,color:"#dc2626",borderColor:"#fecaca"}}>🗑️ Eliminar solicitud</button>}
               {confirmDel&&<>
                 <span style={{fontSize:"13px",color:"#dc2626",fontWeight:"600",alignSelf:"center"}}>¿Seguro que quieres eliminarla?</span>
@@ -755,7 +828,7 @@ function MisSolicitudesView({miEmpleado, sols, recargar}){
                 <button onClick={()=>setConfirmDel(false)} style={BTN_SECONDARY}>Cancelar</button>
               </>}
             </div>
-            {sel.estado!=="Pendiente"&&<p style={{fontSize:"12px",color:"#9ca3af",marginTop:"10px"}}>Ya no se puede eliminar: esta solicitud ya fue {sel.estado==="Aprobada"?"aprobada":"rechazada"}.</p>}
+            {sel.estado!=="Pendiente"&&<p style={{fontSize:"12px",color:"#9ca3af",marginTop:"10px"}}>Ya no se puede editar ni eliminar: esta solicitud ya fue {sel.estado==="Aprobada"?"aprobada":"rechazada"}.</p>}
           </div>
         </div>
       </div>
@@ -768,10 +841,11 @@ function MisSolicitudesView({miEmpleado, sols, recargar}){
       <div style={{display:"flex",flexDirection:"column",gap:"8px"}}>
         {misSolicitudes.map(s=>{
           const c=EC[s.estado]||EC.Pendiente;
+          const sinVer=s.estado!=="Pendiente"&&s.vistoEmpleado===false;
           return(
-            <div key={s.id} onClick={()=>setSel(s)} style={{...CARD,padding:"14px 18px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div key={s.id} onClick={()=>{setSel(s); if(sinVer){ DB.solUpdate(s.id,{vistoEmpleado:true}).then(recargar); }}} style={{...CARD,padding:"14px 18px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",border:sinVer?`1.5px solid ${COLOR_RED}`:CARD.border}}>
               <div>
-                <div style={{fontWeight:"600",fontSize:"14px"}}>N° {s.numero}</div>
+                <div style={{fontWeight:"600",fontSize:"14px"}}>{sinVer&&<span style={{color:COLOR_RED}}>● </span>}N° {s.numero}</div>
                 <div style={{color:"#9ca3af",fontSize:"12px",marginTop:"3px"}}>📅 {fmtD(s.fechaInicio)} → {fmtD(s.fechaFin)} · {s.diasEstimados} día(s)</div>
               </div>
               <span style={{backgroundColor:c.bg,color:c.text,border:`1px solid ${c.border}`,padding:"4px 10px",borderRadius:"20px",fontSize:"11px",fontWeight:"600"}}>{s.estado}</span>
@@ -791,7 +865,7 @@ function AprobacionesView({miEmpleado, sols, recargar}){
   const misSolicitudes=sols.filter(s=>s.jefeCi===miEmpleado.ci);
 
   const cambiarEstado=async(s,est)=>{
-    await DB.solUpdate(s.id,{estado:est,fechaResolucion:new Date().toISOString(),resolvedByCi:miEmpleado.ci});
+    await DB.solUpdate(s.id,{estado:est,fechaResolucion:new Date().toISOString(),resolvedByCi:miEmpleado.ci,vistoEmpleado:false});
     recargar(); setSel(null);
   };
 
@@ -912,8 +986,14 @@ function RRHHEmpleados({emps, sols, recargar}){
   };
   const eliminar=async id=>{
     try{
-      await DB.empDelete(id); setConfirmDelId("");
-      setMsg("🗑️ Empleado eliminado."); setTimeout(()=>setMsg(""),3000);
+      const emp=emps.find(e=>e.id===id);
+      await DB.empDelete(id);
+      if(emp){
+        if(emp.uid) await DB.roleDelete(emp.uid);
+        if(emp.ci) await DB.loginIndexDelete(emp.ci);
+      }
+      setConfirmDelId("");
+      setMsg("🗑️ Empleado eliminado (junto con su acceso, si tenía cuenta)."); setTimeout(()=>setMsg(""),4000);
       recargar();
     }catch(e){
       console.error("Error al eliminar empleado:",e);
@@ -1127,19 +1207,30 @@ function RRHHEmpleados({emps, sols, recargar}){
 // ============================================================
 // PANEL RRHH — SOLICITUDES (todas)
 // ============================================================
-function RRHHSolicitudes({sols, recargar}){
+function RRHHSolicitudes({sols, emps, recargar}){
   const [filtro,setFiltro]=useState("Todas");
   const [busqueda,setBusqueda]=useState("");
   const [sel,setSel]=useState(null);
   const [confirmDel,setConfirmDel]=useState(false);
+  const [editando,setEditando]=useState(false);
+  const [editForm,setEditForm]=useState(null);
+  const [motivoCambio,setMotivoCambio]=useState("");
+  const [feriadosVar,setFeriadosVar]=useState([]);
+  const [errorEdit,setErrorEdit]=useState("");
+  const [savingEdit,setSavingEdit]=useState(false);
   const ESTADOS=["Todas","Pendiente","Aprobada","Rechazada"];
   const b=busqueda.trim().toLowerCase();
   const filtradas=sols
     .filter(s=>filtro==="Todas"||s.estado===filtro)
     .filter(s=>!b||[s.nombreEmpleado,s.ci,s.cargo,s.area,s.jefeNombre].filter(Boolean).some(v=>v.toLowerCase().includes(b)));
 
+  useEffect(()=>{
+    const yr=new Date().getFullYear();
+    Promise.all([DB.ferGet(yr),DB.ferGet(yr+1)]).then(([a,b2])=>setFeriadosVar([...a,...b2]));
+  },[]);
+
   const cambiarEstado=async(s,est)=>{
-    await DB.solUpdate(s.id,{estado:est,fechaResolucion:new Date().toISOString()});
+    await DB.solUpdate(s.id,{estado:est,fechaResolucion:new Date().toISOString(),vistoEmpleado:false});
     recargar(); setSel(null);
   };
 
@@ -1148,6 +1239,85 @@ function RRHHSolicitudes({sols, recargar}){
     setConfirmDel(false); setSel(null);
     recargar();
   };
+
+  const empezarEditar=s=>{
+    setEditForm({tipo:s.tipo,modalidad:s.modalidad,horasPorDia:s.horasPorDia||"1",fechaInicio:s.fechaInicio,fechaFin:s.fechaFin,fechaRetorno:s.fechaRetorno||"",observaciones:s.observaciones||""});
+    setMotivoCambio(""); setErrorEdit(""); setEditando(true);
+  };
+
+  const guardarEdicion=async()=>{
+    setErrorEdit("");
+    if(!editForm.fechaInicio||!editForm.fechaFin){setErrorEdit("Completa las fechas.");return;}
+    if(editForm.fechaFin<editForm.fechaInicio){setErrorEdit("La fecha fin no puede ser menor a la de inicio.");return;}
+    setSavingEdit(true);
+    try{
+      const emp=(emps||[]).find(e=>e.ci===sel.ci);
+      const calc=calcDias(editForm.fechaInicio,editForm.fechaFin,editForm.modalidad,editForm.horasPorDia,feriadosVar,emp?.fechaNacimiento||null,emp?.horarioSemana||"L-V");
+      const desglose=(emp&&editForm.tipo==="VACACION"&&calc.dias>0)?calcDesglosePeriodos(emp,sols.filter(s=>s.id!==sel.id),calc.dias,hoyISO()):[];
+      const notaCambio=motivoCambio.trim()
+        ?`\n[Corregido por RRHH el ${fmtD(hoyISO())}: ${motivoCambio.trim()}]`
+        :`\n[Corregido por RRHH el ${fmtD(hoyISO())}]`;
+      await DB.solUpdate(sel.id,{
+        tipo:editForm.tipo,modalidad:editForm.modalidad,horasPorDia:editForm.horasPorDia,
+        fechaInicio:editForm.fechaInicio,fechaFin:editForm.fechaFin,fechaRetorno:editForm.fechaRetorno,
+        observaciones:(editForm.observaciones||"")+notaCambio,
+        diasEstimados:calc.dias,feriadosEnRango:calc.feriadosEnRango,cumpleEnRango:calc.cumpleEnRango,
+        periodosDesglose:desglose,vistoEmpleado:false,
+      });
+      setEditando(false); setSel(null);
+      recargar();
+    }catch(e){ setErrorEdit("No se pudo guardar. Intenta de nuevo."); }
+    setSavingEdit(false);
+  };
+
+  const exportarCSV=()=>{
+    const esc=v=>{
+      const s=(v===undefined||v===null)?"":String(v);
+      return s.includes(",")||s.includes('"')||s.includes("\n") ? `"${s.replace(/"/g,'""')}"` : s;
+    };
+    const filas=[["Numero","Empleado","CI","Cargo","Area","Tipo","Modalidad","FechaInicio","FechaFin","Dias","Periodos","Estado","Jefe","FechaSolicitud","FechaResolucion","Observaciones"]];
+    filtradas.forEach(s=>{
+      filas.push([s.numero,s.nombreEmpleado,s.ci,s.cargo,s.area,s.tipo,s.modalidad,s.fechaInicio,s.fechaFin,s.diasEstimados,
+        (s.periodosDesglose||[]).map(p=>`${p.label}:${p.dias}`).join(" | "),s.estado,s.jefeNombre,
+        s.fechaSolicitud?s.fechaSolicitud.split("T")[0]:"",s.fechaResolucion?s.fechaResolucion.split("T")[0]:"",s.observaciones]);
+    });
+    const csv=filas.map(f=>f.map(esc).join(",")).join("\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url; a.download=`solicitudes_agromel_${hoyISO()}.csv`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  if(sel&&editando&&editForm){
+    return(
+      <div>
+        <button onClick={()=>setEditando(false)} style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer"}}>← Cancelar edición</button>
+        <div style={{...CARD,maxWidth:"560px",padding:"24px"}}>
+          <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"6px"}}>Corregir solicitud N° {sel.numero}</div>
+          <p style={{fontSize:"12px",color:"#9ca3af",marginBottom:"14px"}}>{sel.nombreEmpleado} — el saldo se recalcula automáticamente con las fechas nuevas.</p>
+          {errorEdit&&<div style={{padding:"10px 14px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",color:"#dc2626",fontSize:"13px",marginBottom:"12px"}}>⚠️ {errorEdit}</div>}
+          <div style={{display:"flex",flexDirection:"column",gap:"12px"}}>
+            <div>
+              <label style={LBL}>Tipo</label>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
+                {Object.entries(TIPO_CFG).map(([v,t])=>(
+                  <button key={v} onClick={()=>setEditForm(p=>({...p,tipo:v}))} style={{padding:"9px 12px",borderRadius:"8px",border:`1.5px solid ${editForm.tipo===v?COLOR_RED:"#e5e7eb"}`,backgroundColor:editForm.tipo===v?"#fef2f2":"white",color:editForm.tipo===v?COLOR_RED:"#6b7280",cursor:"pointer",fontSize:"13px"}}>{t.icon} {t.label}</button>
+                ))}
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
+              <div><label style={LBL}>Fecha inicio</label><input type="date" style={INP} value={editForm.fechaInicio} onChange={e=>setEditForm(p=>({...p,fechaInicio:e.target.value}))}/></div>
+              <div><label style={LBL}>Fecha fin (real)</label><input type="date" style={INP} value={editForm.fechaFin} min={editForm.fechaInicio} onChange={e=>setEditForm(p=>({...p,fechaFin:e.target.value}))}/></div>
+            </div>
+            <div><label style={LBL}>Motivo de la corrección <span style={{color:"#9ca3af",fontWeight:"400"}}>(opcional, queda registrado)</span></label><input style={INP} value={motivoCambio} onChange={e=>setMotivoCambio(e.target.value)} placeholder="Ej: Regresó antes de lo previsto"/></div>
+            <button onClick={guardarEdicion} disabled={savingEdit} style={{...BTN_PRIMARY,opacity:savingEdit?0.6:1}}>{savingEdit?"Guardando...":"💾 Guardar corrección"}</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if(sel){
     const c=EC[sel.estado]||EC.Pendiente;
@@ -1164,11 +1334,13 @@ function RRHHSolicitudes({sols, recargar}){
               {[["N°",sel.numero],["Jefe",sel.jefeNombre||"—"],["Tipo",sel.tipo],["Modalidad",fmtMd(sel.modalidad,sel.horasPorDia)],["Inicio",fmtD(sel.fechaInicio)],["Fin",fmtD(sel.fechaFin)],["Días",`${sel.diasEstimados} día(s)`],["CI",sel.ci]].map(([k,v])=>(
                 <div key={k}><div style={{color:"#9ca3af",fontSize:"11px"}}>{k}</div><div style={{fontWeight:"600"}}>{v}</div></div>
               ))}
+              {sel.observaciones&&<div style={{gridColumn:"1/-1"}}><div style={{color:"#9ca3af",fontSize:"11px"}}>Observaciones</div><div style={{backgroundColor:"#f9fafb",padding:"8px",borderRadius:"6px",whiteSpace:"pre-line"}}>{sel.observaciones}</div></div>}
             </div>
             <div style={{display:"flex",gap:"8px",marginTop:"20px",flexWrap:"wrap"}}>
               {sel.estado!=="Aprobada"&&<button onClick={()=>cambiarEstado(sel,"Aprobada")} style={{...BTN_PRIMARY,backgroundColor:"#16a34a"}}>✅ Aprobar</button>}
               {sel.estado!=="Rechazada"&&<button onClick={()=>cambiarEstado(sel,"Rechazada")} style={{...BTN_PRIMARY,backgroundColor:"#dc2626"}}>❌ Rechazar</button>}
               {sel.estado!=="Pendiente"&&<button onClick={()=>cambiarEstado(sel,"Pendiente")} style={{...BTN_PRIMARY,backgroundColor:"#ca8a04"}}>🔄 Volver a pendiente</button>}
+              <button onClick={()=>empezarEditar(sel)} style={BTN_SECONDARY}>✏️ Corregir fechas</button>
               {!confirmDel&&<button onClick={()=>setConfirmDel(true)} style={{...BTN_SECONDARY,color:"#dc2626",borderColor:"#fecaca"}}>🗑️ Eliminar</button>}
               {confirmDel&&<>
                 <span style={{fontSize:"13px",color:"#dc2626",fontWeight:"600",alignSelf:"center"}}>¿Eliminar definitivamente?</span>
@@ -1185,8 +1357,9 @@ function RRHHSolicitudes({sols, recargar}){
   return(
     <div>
       <input value={busqueda} onChange={e=>setBusqueda(e.target.value)} placeholder="🔍 Buscar por nombre, CI, cargo o área..." style={{...INP,marginBottom:"12px"}}/>
-      <div style={{display:"flex",gap:"6px",marginBottom:"14px",flexWrap:"wrap"}}>
+      <div style={{display:"flex",gap:"6px",marginBottom:"14px",flexWrap:"wrap",alignItems:"center"}}>
         {ESTADOS.map(e=><button key={e} onClick={()=>setFiltro(e)} style={{padding:"6px 14px",borderRadius:"20px",border:`1.5px solid ${filtro===e?COLOR_RED:"#e5e7eb"}`,backgroundColor:filtro===e?COLOR_RED:"white",color:filtro===e?"white":"#6b7280",cursor:"pointer",fontSize:"13px"}}>{e}</button>)}
+        <button onClick={exportarCSV} style={{...BTN_SECONDARY,padding:"6px 14px",fontSize:"13px"}}>💾 Exportar CSV</button>
       </div>
       {filtradas.length===0?<div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}>No hay solicitudes.</div>:
       <div style={{display:"flex",flexDirection:"column",gap:"8px"}}>
@@ -1615,10 +1788,13 @@ function AppMain(){
 
   const tieneEquipo=emps.some(e=>e.jefeCi===miEmpleado.ci);
   const esCuentaAdmin=!!miEmpleado.cuentaAdmin;
+  const pendAprobar=sols.filter(s=>s.jefeCi===miEmpleado.ci&&s.estado==="Pendiente").length;
+  const pendRRHH=sols.filter(s=>s.estado==="Pendiente").length;
+  const misSinVer=sols.filter(s=>s.ci===miEmpleado.ci&&s.estado!=="Pendiente"&&s.vistoEmpleado===false).length;
   const TABS=[
-    ...(esCuentaAdmin?[]:[{id:"solicitar",label:"🏖️ Solicitar"},{id:"mis_sol",label:"📄 Mis Solicitudes"}]),
-    ...(!esCuentaAdmin&&tieneEquipo?[{id:"aprobaciones",label:"✅ Aprobaciones"}]:[]),
-    ...(miEmpleado.esRRHH?[{id:"rrhh_emp",label:"👥 Empleados"},{id:"rrhh_sol_por_emp",label:"📝 Solicitar por Empleado"},{id:"rrhh_reg",label:"➕ Registrar Vacación"},{id:"rrhh_sol",label:"📋 Solicitudes"},{id:"rrhh_fer",label:"🏳️ Feriados"}]:[]),
+    ...(esCuentaAdmin?[]:[{id:"solicitar",label:"🏖️ Solicitar"},{id:"mis_sol",label:"📄 Mis Solicitudes",badge:misSinVer}]),
+    ...(!esCuentaAdmin&&tieneEquipo?[{id:"aprobaciones",label:"✅ Aprobaciones",badge:pendAprobar}]:[]),
+    ...(miEmpleado.esRRHH?[{id:"rrhh_emp",label:"👥 Empleados"},{id:"rrhh_sol_por_emp",label:"📝 Solicitar por Empleado"},{id:"rrhh_reg",label:"➕ Registrar Vacación"},{id:"rrhh_sol",label:"📋 Solicitudes",badge:pendRRHH},{id:"rrhh_fer",label:"🏳️ Feriados"}]:[]),
   ];
 
   return(
@@ -1634,7 +1810,10 @@ function AppMain(){
       </div>
       <div className="print-hidden" style={{maxWidth:"900px",margin:"0 auto",padding:"12px 16px 0",display:"flex",gap:"4px",flexWrap:"wrap",borderBottom:"2px solid #e5e7eb"}}>
         {TABS.map(t=>(
-          <button key={t.id} onClick={()=>setView(t.id)} style={{padding:"10px 16px",border:"none",borderBottom:`2px solid ${view===t.id?COLOR_RED:"transparent"}`,marginBottom:"-2px",backgroundColor:"transparent",color:view===t.id?COLOR_RED:"#6b7280",fontWeight:view===t.id?"700":"400",cursor:"pointer",fontSize:"14px"}}>{t.label}</button>
+          <button key={t.id} onClick={()=>setView(t.id)} style={{position:"relative",padding:"10px 16px",border:"none",borderBottom:`2px solid ${view===t.id?COLOR_RED:"transparent"}`,marginBottom:"-2px",backgroundColor:"transparent",color:view===t.id?COLOR_RED:"#6b7280",fontWeight:view===t.id?"700":"400",cursor:"pointer",fontSize:"14px"}}>
+            {t.label}
+            {!!t.badge&&<span style={{marginLeft:"6px",backgroundColor:COLOR_RED,color:"white",borderRadius:"999px",fontSize:"11px",fontWeight:"700",padding:"1px 7px"}}>{t.badge}</span>}
+          </button>
         ))}
       </div>
       <div style={{maxWidth:"900px",margin:"0 auto",padding:"24px 16px"}}>
@@ -1644,7 +1823,7 @@ function AppMain(){
         {view==="rrhh_emp"&&miEmpleado.esRRHH&&<RRHHEmpleados emps={emps} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_sol_por_emp"&&miEmpleado.esRRHH&&<RRHHSolicitarPorEmpleado emps={emps} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_reg"&&miEmpleado.esRRHH&&<RRHHRegistrarVacacion emps={emps} sols={sols} recargar={recargarTodo}/>}
-        {view==="rrhh_sol"&&miEmpleado.esRRHH&&<RRHHSolicitudes sols={sols} recargar={recargarTodo}/>}
+        {view==="rrhh_sol"&&miEmpleado.esRRHH&&<RRHHSolicitudes sols={sols} emps={emps} recargar={recargarTodo}/>}
         {view==="rrhh_fer"&&miEmpleado.esRRHH&&<RRHHFeriados/>}
       </div>
     </div>
