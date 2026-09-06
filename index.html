@@ -179,8 +179,11 @@ function calcSaldoActual(emp, sols, fechaRef){
   const acumuladoDesdeCorte=emp.fechaIngreso
     ? (calcDiasAcumulados(emp.fechaIngreso,ref)-calcDiasAcumulados(emp.fechaIngreso,corte))
     : 0;
+  // Importante: se compara la fecha en que se REGISTRO la solicitud (fechaSolicitud), no la fecha
+  // de la vacacion en si (fechaInicio) — asi, una vacacion ya tomada que se registra despues
+  // (retroactiva) sí se descuenta, aunque sus fechas sean anteriores al corte del saldo.
   const usadoDesdeCorte=(sols||[])
-    .filter(s=>s.ci&&emp.ci&&s.ci===emp.ci&&s.estado==="Aprobada"&&s.tipo!=="COMPENSACION"&&s.fechaInicio&&s.fechaInicio>=corte)
+    .filter(s=>s.ci&&emp.ci&&s.ci===emp.ci&&s.estado==="Aprobada"&&s.tipo!=="COMPENSACION"&&s.fechaSolicitud&&s.fechaSolicitud.split("T")[0]>=corte)
     .reduce((sum,s)=>sum+(parseFloat(s.diasEstimados)||0),0);
   return Math.round((base+acumuladoDesdeCorte-usadoDesdeCorte)*10)/10;
 }
@@ -227,10 +230,12 @@ function calcPeriodos(emp, sols, fechaRef){
       p.diasUsados=usar; usadoPreCorte-=usar;
     }
   }
-  // Solicitudes aprobadas desde el corte, en orden cronologico, consumen FIFO
+  // Solicitudes aprobadas registradas desde el corte, en orden cronologico, consumen FIFO
+  // (se usa fechaSolicitud —cuando se registro— no fechaInicio —cuando fue la vacacion—,
+  // para que las vacaciones retroactivas se descuenten correctamente)
   const usos=(sols||[])
-    .filter(s=>s.ci&&emp.ci&&s.ci===emp.ci&&s.estado==="Aprobada"&&s.tipo!=="COMPENSACION"&&s.fechaInicio&&s.fechaInicio>=corte)
-    .sort((a,b)=>a.fechaInicio.localeCompare(b.fechaInicio));
+    .filter(s=>s.ci&&emp.ci&&s.ci===emp.ci&&s.estado==="Aprobada"&&s.tipo!=="COMPENSACION"&&s.fechaSolicitud&&s.fechaSolicitud.split("T")[0]>=corte)
+    .sort((a,b)=>(a.fechaSolicitud||"").localeCompare(b.fechaSolicitud||""));
   for(const u of usos){
     let restante=parseFloat(u.diasEstimados)||0;
     for(const p of periodos){
@@ -327,6 +332,25 @@ const DB = {
   async roleDelete(uid){
     if(!uid) return;
     await window.__fbDb.collection("roles").doc(uid).delete().catch(()=>{});
+  },
+  // Espejo minimo uid -> CI, usado por las reglas de Firestore para saber si quien escribe
+  // es el dueño de una solicitud o su jefe asignado (sin exponer el resto de sus datos).
+  async ciPorUidSet(uid,ci){
+    if(!uid||!ci) return;
+    await window.__fbDb.collection("ci_por_uid").doc(uid).set({ci});
+  },
+  async ciPorUidDelete(uid){
+    if(!uid) return;
+    await window.__fbDb.collection("ci_por_uid").doc(uid).delete().catch(()=>{});
+  },
+  // Registro de respaldo: quien creo o elimino una solicitud, con una copia de sus datos.
+  async auditLog(entry){
+    try{ await window.__fbDb.collection("auditoria").add({...entry,fecha:new Date().toISOString()}); }
+    catch(e){ console.error("No se pudo registrar auditoría:",e); }
+  },
+  async auditGetAll(){
+    const snap=await window.__fbDb.collection("auditoria").get();
+    return snap.docs.map(d=>({id:d.id,...d.data()}));
   },
 };
 
@@ -497,6 +521,7 @@ function AuthScreen(){
         await DB.empSave({ci:ci.trim(),nombre:"",cargo:"",area:AREAS[0],sucursal:SUCURSALES[0],fechaIngreso:"",
           codigo:"",diasDisponibles:"0",fechaCorteSaldo:hoyISO(),fechaNacimiento:"",jefeCi:"",esRRHH:true,
           uid:cred.user.uid,email:authEmail});
+        await DB.ciPorUidSet(cred.user.uid,ci.trim());
         setMsg("¡Cuenta creada! Eres la primera persona registrada, así que tienes acceso al Panel RRHH.");
         setLoading(false); return;
       }
@@ -512,6 +537,7 @@ function AuthScreen(){
         setLoading(false); return;
       }
       await DB.empSave({id:empExistente.id,uid:cred.user.uid,email:authEmail});
+      await DB.ciPorUidSet(cred.user.uid,ci.trim());
       setMsg("¡Cuenta creada correctamente!");
     }catch(e){
       if(cred) await cred.user.delete().catch(()=>{});
@@ -617,8 +643,10 @@ function SolicitarView({miEmpleado, sols, recargar}){
         periodosDesglose:form.tipo==="VACACION"?desglosePeriodos:[],
         estado:"Pendiente", jefeCi:miEmpleado.jefeCi||"", jefeNombre:jefe?jefe.nombre:"",
         fechaSolicitud:new Date().toISOString(),
+        creadaPorUid:window.__fbAuth.currentUser?.uid||"", creadaPorNombre:miEmpleado.nombre, creadaPorCi:miEmpleado.ci,
       };
       const id=await DB.solCreate(nueva);
+      DB.auditLog({tipo:"creada",solicitudId:id,numero:nueva.numero,empleadoCi:nueva.ci,nombreEmpleado:nueva.nombre,dias:nueva.diasEstimados,porUid:nueva.creadaPorUid,porNombre:miEmpleado.nombre,detalle:"Creada por el propio empleado"});
       setSolGuardada({...nueva,id}); setStep("preview");
       recargar();
     }catch(e){ console.error("Error al generar solicitud:",e); setError(`No se pudo guardar la solicitud: ${e.message||"error desconocido"}.`); }
@@ -730,6 +758,8 @@ function MisSolicitudesView({miEmpleado, sols, recargar}){
   },[]);
 
   const eliminar=async s=>{
+    await DB.auditLog({tipo:"eliminada",solicitudId:s.id,numero:s.numero,empleadoCi:s.ci,nombreEmpleado:s.nombreEmpleado,dias:s.diasEstimados,
+      porUid:window.__fbAuth.currentUser?.uid||"",porNombre:miEmpleado.nombre,detalle:"Eliminada por el propio empleado",copiaSolicitud:s});
     await DB.solDelete(s.id);
     setConfirmDel(false); setSel(null);
     recargar();
@@ -860,9 +890,13 @@ function MisSolicitudesView({miEmpleado, sols, recargar}){
 // ============================================================
 // VISTA: APROBACIONES (para jefes)
 // ============================================================
-function AprobacionesView({miEmpleado, sols, recargar}){
+function AprobacionesView({miEmpleado, sols, emps, recargar}){
   const [sel,setSel]=useState(null);
-  const misSolicitudes=sols.filter(s=>s.jefeCi===miEmpleado.ci);
+  const [showPrint,setShowPrint]=useState(false);
+  // Incluye las solicitudes donde soy el jefe titular, y tambien las de empleados
+  // que me designaron como aprobador de respaldo (por si su jefe titular no esta disponible).
+  const cisComoSuplente=(emps||[]).filter(e=>e.aprobadorSuplenteCi===miEmpleado.ci).map(e=>e.ci);
+  const misSolicitudes=sols.filter(s=>s.jefeCi===miEmpleado.ci||cisComoSuplente.includes(s.ci));
 
   const cambiarEstado=async(s,est)=>{
     await DB.solUpdate(s.id,{estado:est,fechaResolucion:new Date().toISOString(),resolvedByCi:miEmpleado.ci,vistoEmpleado:false});
@@ -870,6 +904,16 @@ function AprobacionesView({miEmpleado, sols, recargar}){
   };
 
   if(!misSolicitudes.length) return <div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}><div style={{fontSize:"36px",marginBottom:"8px"}}>📭</div><p>No tienes solicitudes de tu equipo por revisar.</p></div>;
+
+  if(showPrint&&sel) return(
+    <div>
+      <button onClick={()=>setShowPrint(false)} className="print-hidden" style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer",fontSize:"14px"}}>← Volver</button>
+      <div className="print-hidden" style={{marginBottom:"12px"}}>
+        <button onClick={()=>window.print()} style={BTN_PRIMARY}>🖨️ Imprimir</button>
+      </div>
+      <PrintForm s={sel}/>
+    </div>
+  );
 
   if(sel){
     const c=EC[sel.estado]||EC.Pendiente;
@@ -893,10 +937,11 @@ function AprobacionesView({miEmpleado, sols, recargar}){
                 ⚠️ Esta solicitud pide más días ({sel.diasEstimados}) de los que tenía disponibles al momento de solicitar ({sel.diasDisponibles}).
               </div>
             )}
-            {sel.estado==="Pendiente"&&<div style={{display:"flex",gap:"8px",marginTop:"20px"}}>
-              <button onClick={()=>cambiarEstado(sel,"Aprobada")} style={{...BTN_PRIMARY,backgroundColor:"#16a34a"}}>✅ Aprobar</button>
-              <button onClick={()=>cambiarEstado(sel,"Rechazada")} style={{...BTN_PRIMARY,backgroundColor:"#dc2626"}}>❌ Rechazar</button>
-            </div>}
+            <div style={{display:"flex",gap:"8px",marginTop:"20px",flexWrap:"wrap"}}>
+              <button onClick={()=>setShowPrint(true)} style={BTN_SECONDARY}>🖨️ Ver / Imprimir formulario</button>
+              {sel.estado==="Pendiente"&&<button onClick={()=>cambiarEstado(sel,"Aprobada")} style={{...BTN_PRIMARY,backgroundColor:"#16a34a"}}>✅ Aprobar</button>}
+              {sel.estado==="Pendiente"&&<button onClick={()=>cambiarEstado(sel,"Rechazada")} style={{...BTN_PRIMARY,backgroundColor:"#dc2626"}}>❌ Rechazar</button>}
+            </div>
           </div>
         </div>
       </div>
@@ -928,7 +973,7 @@ function AprobacionesView({miEmpleado, sols, recargar}){
 // PANEL RRHH — EMPLEADOS
 // ============================================================
 function RRHHEmpleados({emps, sols, recargar}){
-  const DEFAULT_EMP={id:"",nombre:"",ci:"",cargo:"",area:AREAS[0],sucursal:SUCURSALES[0],fechaIngreso:"",codigo:"",diasDisponibles:"",fechaCorteSaldo:"",fechaNacimiento:"",jefeCi:"",esRRHH:false,cuentaAdmin:false,horarioSemana:"L-V"};
+  const DEFAULT_EMP={id:"",nombre:"",ci:"",cargo:"",area:AREAS[0],sucursal:SUCURSALES[0],fechaIngreso:"",codigo:"",diasDisponibles:"",fechaCorteSaldo:"",fechaNacimiento:"",jefeCi:"",aprobadorSuplenteCi:"",esRRHH:false,cuentaAdmin:false,horarioSemana:"L-V"};
   const [form,setForm]=useState(DEFAULT_EMP);
   const [editing,setEditing]=useState(false);
   const [msg,setMsg]=useState("");
@@ -969,7 +1014,7 @@ function RRHHEmpleados({emps, sols, recargar}){
       const {id,...datos}=form;
       const nuevo=id?{id,...datos,fechaCorteSaldo:hoyISO()}:{...datos,fechaCorteSaldo:hoyISO()};
       const nuevoId=await DB.empSave(nuevo);
-      if(nuevo.uid) await DB.roleSet(nuevo.uid,nuevo.esRRHH);
+      if(nuevo.uid){ await DB.roleSet(nuevo.uid,nuevo.esRRHH); await DB.ciPorUidSet(nuevo.uid,nuevo.ci); }
       setForm(DEFAULT_EMP); setEditing(false);
       setMsg("✅ Empleado guardado."); setTimeout(()=>setMsg(""),3000);
       recargar();
@@ -989,7 +1034,7 @@ function RRHHEmpleados({emps, sols, recargar}){
       const emp=emps.find(e=>e.id===id);
       await DB.empDelete(id);
       if(emp){
-        if(emp.uid) await DB.roleDelete(emp.uid);
+        if(emp.uid){ await DB.roleDelete(emp.uid); await DB.ciPorUidDelete(emp.uid); }
         if(emp.ci) await DB.loginIndexDelete(emp.ci);
       }
       setConfirmDelId("");
@@ -1125,6 +1170,13 @@ function RRHHEmpleados({emps, sols, recargar}){
                 {emps.filter(x=>x.ci!==form.ci&&!x.cuentaAdmin).map(x=><option key={x.id} value={x.ci}>{x.nombre} ({x.cargo})</option>)}
               </select>
             </div>
+            <div>
+              <label style={L}>Aprobador de respaldo <span style={{color:"#9ca3af",fontWeight:"400"}}>(si el jefe no está)</span></label>
+              <select style={I} value={form.aprobadorSuplenteCi||""} onChange={e=>setF("aprobadorSuplenteCi",e.target.value)}>
+                <option value="">— Ninguno —</option>
+                {emps.filter(x=>x.ci!==form.ci&&!x.cuentaAdmin).map(x=><option key={x.id} value={x.ci}>{x.nombre} ({x.cargo})</option>)}
+              </select>
+            </div>
             <div style={{gridColumn:"1/-1"}}>
               <label style={L}>Días disponibles (saldo a hoy)</label>
               <input type="number" step="0.5" style={I} value={form.diasDisponibles} onChange={e=>setF("diasDisponibles",e.target.value)}/>
@@ -1212,6 +1264,7 @@ function RRHHSolicitudes({sols, emps, recargar}){
   const [busqueda,setBusqueda]=useState("");
   const [sel,setSel]=useState(null);
   const [confirmDel,setConfirmDel]=useState(false);
+  const [showPrint,setShowPrint]=useState(false);
   const [editando,setEditando]=useState(false);
   const [editForm,setEditForm]=useState(null);
   const [motivoCambio,setMotivoCambio]=useState("");
@@ -1235,6 +1288,10 @@ function RRHHSolicitudes({sols, emps, recargar}){
   };
 
   const eliminar=async s=>{
+    const miUid=window.__fbAuth.currentUser?.uid||"";
+    const yo=(emps||[]).find(e=>e.uid===miUid);
+    await DB.auditLog({tipo:"eliminada",solicitudId:s.id,numero:s.numero,empleadoCi:s.ci,nombreEmpleado:s.nombreEmpleado,dias:s.diasEstimados,
+      porUid:miUid,porNombre:yo?.nombre||"RRHH",detalle:"Eliminada por RRHH",copiaSolicitud:s});
     await DB.solDelete(s.id);
     setConfirmDel(false); setSel(null);
     recargar();
@@ -1319,6 +1376,16 @@ function RRHHSolicitudes({sols, emps, recargar}){
     );
   }
 
+  if(showPrint&&sel) return(
+    <div>
+      <button onClick={()=>setShowPrint(false)} className="print-hidden" style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer",fontSize:"14px"}}>← Volver</button>
+      <div className="print-hidden" style={{marginBottom:"12px"}}>
+        <button onClick={()=>window.print()} style={BTN_PRIMARY}>🖨️ Imprimir</button>
+      </div>
+      <PrintForm s={sel}/>
+    </div>
+  );
+
   if(sel){
     const c=EC[sel.estado]||EC.Pendiente;
     return(
@@ -1337,6 +1404,7 @@ function RRHHSolicitudes({sols, emps, recargar}){
               {sel.observaciones&&<div style={{gridColumn:"1/-1"}}><div style={{color:"#9ca3af",fontSize:"11px"}}>Observaciones</div><div style={{backgroundColor:"#f9fafb",padding:"8px",borderRadius:"6px",whiteSpace:"pre-line"}}>{sel.observaciones}</div></div>}
             </div>
             <div style={{display:"flex",gap:"8px",marginTop:"20px",flexWrap:"wrap"}}>
+              <button onClick={()=>setShowPrint(true)} style={BTN_SECONDARY}>🖨️ Ver / Imprimir formulario</button>
               {sel.estado!=="Aprobada"&&<button onClick={()=>cambiarEstado(sel,"Aprobada")} style={{...BTN_PRIMARY,backgroundColor:"#16a34a"}}>✅ Aprobar</button>}
               {sel.estado!=="Rechazada"&&<button onClick={()=>cambiarEstado(sel,"Rechazada")} style={{...BTN_PRIMARY,backgroundColor:"#dc2626"}}>❌ Rechazar</button>}
               {sel.estado!=="Pendiente"&&<button onClick={()=>cambiarEstado(sel,"Pendiente")} style={{...BTN_PRIMARY,backgroundColor:"#ca8a04"}}>🔄 Volver a pendiente</button>}
@@ -1409,6 +1477,8 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
     setSaving(true);
     try{
       const jefe=emp.jefeCi?await DB.empGetByCi(emp.jefeCi):null;
+      const miUid=window.__fbAuth.currentUser?.uid||"";
+      const yo=(emps||[]).find(e=>e.uid===miUid);
       const nueva={
         numero:genNum(), empleadoCi:emp.ci, nombreEmpleado:emp.nombre, ci:emp.ci,
         cargo:emp.cargo, area:emp.area, sucursal:emp.sucursal||"", fechaIngreso:emp.fechaIngreso||"",
@@ -1420,9 +1490,10 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
         periodosDesglose:tipo==="VACACION"?desglosePeriodos:[],
         estado:"Aprobada", jefeCi:emp.jefeCi||"", jefeNombre:jefe?jefe.nombre:"",
         fechaSolicitud:new Date().toISOString(), fechaResolucion:new Date().toISOString(),
-        registradaPorRRHH:true,
+        registradaPorRRHH:true, creadaPorUid:miUid, creadaPorNombre:yo?.nombre||"RRHH", creadaPorCi:yo?.ci||"",
       };
-      await DB.solCreate(nueva);
+      const idNueva=await DB.solCreate(nueva);
+      DB.auditLog({tipo:"creada",solicitudId:idNueva,numero:nueva.numero,empleadoCi:nueva.ci,nombreEmpleado:nueva.nombre,dias:nueva.diasEstimados,porUid:miUid,porNombre:yo?.nombre||"RRHH",detalle:"Registrada por RRHH (vacación ya tomada)"});
       setMsg(`✅ Registrada: se descontaron ${diasCalc.dias} día(s) del saldo de ${emp.nombre}.`);
       setEmpId(""); setFechaInicio(""); setFechaFin(""); setObservaciones(""); setModalidad("DIA_COMPLETO"); setHorasPorDia("1");
       recargar();
@@ -1527,6 +1598,8 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
     setError(""); setSaving(true);
     try{
       const jefe=emp.jefeCi?await DB.empGetByCi(emp.jefeCi):null;
+      const miUid=window.__fbAuth.currentUser?.uid||"";
+      const yo=(emps||[]).find(e=>e.uid===miUid);
       const nueva={
         numero:genNum(), empleadoCi:emp.ci, nombreEmpleado:emp.nombre, ci:emp.ci,
         cargo:emp.cargo, area:emp.area, sucursal:emp.sucursal||"", fechaIngreso:emp.fechaIngreso||"",
@@ -1538,8 +1611,10 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
         periodosDesglose:form.tipo==="VACACION"?desglosePeriodos:[],
         estado:"Pendiente", jefeCi:emp.jefeCi||"", jefeNombre:jefe?jefe.nombre:"",
         fechaSolicitud:new Date().toISOString(), creadaPorRRHH:true,
+        creadaPorUid:miUid, creadaPorNombre:yo?.nombre||"RRHH", creadaPorCi:yo?.ci||"",
       };
       const id=await DB.solCreate(nueva);
+      DB.auditLog({tipo:"creada",solicitudId:id,numero:nueva.numero,empleadoCi:nueva.ci,nombreEmpleado:nueva.nombre,dias:nueva.diasEstimados,porUid:miUid,porNombre:yo?.nombre||"RRHH",detalle:"Solicitada por RRHH en nombre del empleado"});
       setSolGuardada({...nueva,id}); setStep("preview");
       recargar();
     }catch(e){ console.error("Error al generar solicitud:",e); setError(`No se pudo guardar la solicitud: ${e.message||"error desconocido"}.`); }
@@ -1635,6 +1710,68 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
           <button onClick={generar} disabled={saving} style={{...BTN_PRIMARY,width:"100%",padding:"13px",fontSize:"15px",opacity:saving?0.6:1}}>{saving?"Generando...":"✅ Generar y enviar formulario"}</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PANEL RRHH — AUDITORÍA (respaldo de creaciones y eliminaciones)
+// ============================================================
+function RRHHAuditoria(){
+  const [registros,setRegistros]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [busqueda,setBusqueda]=useState("");
+  const [sel,setSel]=useState(null);
+
+  useEffect(()=>{
+    DB.auditGetAll().then(r=>{
+      setRegistros(r.sort((a,b)=>(b.fecha||"").localeCompare(a.fecha||"")));
+      setLoading(false);
+    });
+  },[]);
+
+  const b=busqueda.trim().toLowerCase();
+  const filtrados=registros.filter(r=>!b||[r.nombreEmpleado,r.numero,r.porNombre,r.detalle].filter(Boolean).some(v=>String(v).toLowerCase().includes(b)));
+
+  if(sel) return(
+    <div>
+      <button onClick={()=>setSel(null)} style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer"}}>← Lista</button>
+      <div style={{...CARD,padding:"20px 24px"}}>
+        <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"12px"}}>{sel.tipo==="eliminada"?"🗑️ Eliminación":"➕ Creación"} — N° {sel.numero}</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",fontSize:"13px",marginBottom:"14px"}}>
+          {[["Empleado",sel.nombreEmpleado],["CI",sel.empleadoCi],["Días",sel.dias],["Hecho por",sel.porNombre],["Fecha del registro",fmtD(sel.fecha?.split("T")[0])],["Detalle",sel.detalle]].map(([k,v])=>(
+            <div key={k}><div style={{color:"#9ca3af",fontSize:"11px"}}>{k}</div><div style={{fontWeight:"600"}}>{v||"—"}</div></div>
+          ))}
+        </div>
+        {sel.copiaSolicitud&&<>
+          <div style={{fontSize:"12px",fontWeight:"700",color:"#6b7280",marginBottom:"6px"}}>Copia de la solicitud eliminada:</div>
+          <div style={{backgroundColor:"#f9fafb",borderRadius:"8px",padding:"10px",fontSize:"12px",display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
+            {[["Tipo",sel.copiaSolicitud.tipo],["Estado",sel.copiaSolicitud.estado],["Inicio",fmtD(sel.copiaSolicitud.fechaInicio)],["Fin",fmtD(sel.copiaSolicitud.fechaFin)],["Jefe",sel.copiaSolicitud.jefeNombre],["Observaciones",sel.copiaSolicitud.observaciones]].map(([k,v])=>(
+              <div key={k}><span style={{color:"#9ca3af"}}>{k}: </span><span style={{fontWeight:"600"}}>{v||"—"}</span></div>
+            ))}
+          </div>
+        </>}
+      </div>
+    </div>
+  );
+
+  return(
+    <div>
+      <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"6px"}}>Auditoría de solicitudes</div>
+      <p style={{fontSize:"12px",color:"#9ca3af",marginBottom:"14px"}}>Respaldo de quién creó o eliminó cada solicitud, con copia de los datos al momento de eliminarla.</p>
+      <input value={busqueda} onChange={e=>setBusqueda(e.target.value)} placeholder="🔍 Buscar por empleado, N°, quién lo hizo..." style={{...INP,marginBottom:"14px"}}/>
+      {loading?<div style={{textAlign:"center",padding:"30px",color:"#9ca3af"}}>Cargando...</div>:
+      filtrados.length===0?<div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}>No hay registros todavía.</div>:
+      <div style={{display:"flex",flexDirection:"column",gap:"6px"}}>
+        {filtrados.map(r=>(
+          <div key={r.id} onClick={()=>setSel(r)} style={{...CARD,padding:"12px 16px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div>
+              <div style={{fontWeight:"600",fontSize:"13px"}}>{r.tipo==="eliminada"?"🗑️":"➕"} N° {r.numero} — {r.nombreEmpleado}</div>
+              <div style={{color:"#9ca3af",fontSize:"12px",marginTop:"2px"}}>{r.detalle} · por {r.porNombre} · {fmtD(r.fecha?.split("T")[0])}</div>
+            </div>
+          </div>
+        ))}
+      </div>}
     </div>
   );
 }
@@ -1786,15 +1923,16 @@ function AppMain(){
     </div>
   );
 
-  const tieneEquipo=emps.some(e=>e.jefeCi===miEmpleado.ci);
+  const tieneEquipo=emps.some(e=>e.jefeCi===miEmpleado.ci||e.aprobadorSuplenteCi===miEmpleado.ci);
   const esCuentaAdmin=!!miEmpleado.cuentaAdmin;
-  const pendAprobar=sols.filter(s=>s.jefeCi===miEmpleado.ci&&s.estado==="Pendiente").length;
+  const cisComoSuplenteDe=emps.filter(e=>e.aprobadorSuplenteCi===miEmpleado.ci).map(e=>e.ci);
+  const pendAprobar=sols.filter(s=>(s.jefeCi===miEmpleado.ci||cisComoSuplenteDe.includes(s.ci))&&s.estado==="Pendiente").length;
   const pendRRHH=sols.filter(s=>s.estado==="Pendiente").length;
   const misSinVer=sols.filter(s=>s.ci===miEmpleado.ci&&s.estado!=="Pendiente"&&s.vistoEmpleado===false).length;
   const TABS=[
     ...(esCuentaAdmin?[]:[{id:"solicitar",label:"🏖️ Solicitar"},{id:"mis_sol",label:"📄 Mis Solicitudes",badge:misSinVer}]),
     ...(!esCuentaAdmin&&tieneEquipo?[{id:"aprobaciones",label:"✅ Aprobaciones",badge:pendAprobar}]:[]),
-    ...(miEmpleado.esRRHH?[{id:"rrhh_emp",label:"👥 Empleados"},{id:"rrhh_sol_por_emp",label:"📝 Solicitar por Empleado"},{id:"rrhh_reg",label:"➕ Registrar Vacación"},{id:"rrhh_sol",label:"📋 Solicitudes",badge:pendRRHH},{id:"rrhh_fer",label:"🏳️ Feriados"}]:[]),
+    ...(miEmpleado.esRRHH?[{id:"rrhh_emp",label:"👥 Empleados"},{id:"rrhh_sol_por_emp",label:"📝 Solicitar por Empleado"},{id:"rrhh_reg",label:"➕ Registrar Vacación"},{id:"rrhh_sol",label:"📋 Solicitudes",badge:pendRRHH},{id:"rrhh_fer",label:"🏳️ Feriados"},{id:"rrhh_audit",label:"🗄️ Auditoría"}]:[]),
   ];
 
   return(
@@ -1819,12 +1957,13 @@ function AppMain(){
       <div style={{maxWidth:"900px",margin:"0 auto",padding:"24px 16px"}}>
         {view==="solicitar"&&<SolicitarView miEmpleado={miEmpleado} sols={sols} recargar={recargarTodo}/>}
         {view==="mis_sol"&&<MisSolicitudesView miEmpleado={miEmpleado} sols={sols} recargar={recargarTodo}/>}
-        {view==="aprobaciones"&&tieneEquipo&&<AprobacionesView miEmpleado={miEmpleado} sols={sols} recargar={recargarTodo}/>}
+        {view==="aprobaciones"&&tieneEquipo&&<AprobacionesView miEmpleado={miEmpleado} sols={sols} emps={emps} recargar={recargarTodo}/>}
         {view==="rrhh_emp"&&miEmpleado.esRRHH&&<RRHHEmpleados emps={emps} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_sol_por_emp"&&miEmpleado.esRRHH&&<RRHHSolicitarPorEmpleado emps={emps} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_reg"&&miEmpleado.esRRHH&&<RRHHRegistrarVacacion emps={emps} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_sol"&&miEmpleado.esRRHH&&<RRHHSolicitudes sols={sols} emps={emps} recargar={recargarTodo}/>}
         {view==="rrhh_fer"&&miEmpleado.esRRHH&&<RRHHFeriados/>}
+        {view==="rrhh_audit"&&miEmpleado.esRRHH&&<RRHHAuditoria/>}
       </div>
     </div>
   );
