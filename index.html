@@ -107,6 +107,23 @@ function getFeriadoDesc(dateStr, feriadosVar=[]) {
   return variable?variable.desc:null;
 }
 
+// Devuelve la fecha del siguiente dia habil despues de fechaFin, segun el horario del empleado
+// (L-V: no laboran sabado ni domingo; L-S: solo domingo) y saltando tambien los feriados.
+function calcFechaRetorno(fechaFin, horarioSemana="L-V", feriadosVar=[]){
+  if(!fechaFin) return "";
+  const noLaborable=dow=>horarioSemana==="L-S"?dow===0:(dow===0||dow===6);
+  let cur=new Date(fechaFin+"T12:00:00");
+  if(isNaN(cur.getTime())) return "";
+  cur.setDate(cur.getDate()+1);
+  for(let i=0;i<30;i++){
+    const dow=cur.getDay();
+    const ds=cur.toISOString().split("T")[0];
+    if(!noLaborable(dow)&&!getFeriadoDesc(ds,feriadosVar)) return ds;
+    cur.setDate(cur.getDate()+1);
+  }
+  return cur.toISOString().split("T")[0];
+}
+
 function calcDias(ini, fin, mod, hpd, feriadosVar=[], fechaNac=null, horarioSemana="L-V") {
   if(!ini||!fin) return {dias:0,feriadosEnRango:[],cumpleEnRango:null};
   let count=0;
@@ -428,7 +445,7 @@ function PrintForm({s}) {
         </tr>
         <tr>
           <td style={td2}>{s.periodosDesglose&&s.periodosDesglose.length?s.periodosDesglose.map((p,i)=>(
-            <div key={i} style={{lineHeight:"1.4"}}>{p.label}{p.dias!==undefined?`: ${fmtNum(p.dias)} día(s)`:""}</div>
+            <div key={i} style={{lineHeight:"1.4"}}>{p.label}</div>
           )):(s.fechaInicio?s.fechaInicio.slice(0,4):"")}</td>
           <td style={td2}>{fmtD(s.fechaInicio)}</td>
           <td style={td2}>{fmtD(s.fechaFin)}</td>
@@ -618,6 +635,8 @@ function SolicitarView({miEmpleado, sols, recargar}){
   const saldoActual=useMemo(()=>calcSaldoActual(miEmpleado,sols),[miEmpleado,sols]);
   const desglosePeriodos=useMemo(()=>(form.tipo==="VACACION"&&calcResult.dias>0)?calcDesglosePeriodos(miEmpleado,sols,calcResult.dias,hoyISO()):[],
     [miEmpleado,sols,form.tipo,calcResult.dias]);
+  const fechaRetornoCalc=useMemo(()=>calcFechaRetorno(form.fechaFin,miEmpleado.horarioSemana||"L-V",feriadosVar),
+    [form.fechaFin,miEmpleado.horarioSemana,feriadosVar]);
 
   const validar=()=>{
     if(!form.fechaInicio) return "Selecciona la fecha de inicio.";
@@ -637,7 +656,7 @@ function SolicitarView({miEmpleado, sols, recargar}){
         cargo:miEmpleado.cargo, area:miEmpleado.area, sucursal:miEmpleado.sucursal||"", fechaIngreso:miEmpleado.fechaIngreso||"",
         codigo:miEmpleado.codigo||"", diasDisponibles:String(saldoActual),
         tipo:form.tipo, modalidad:form.modalidad, horasPorDia:form.horasPorDia,
-        fechaInicio:form.fechaInicio, fechaFin:form.fechaFin, fechaRetorno:form.fechaRetorno,
+        fechaInicio:form.fechaInicio, fechaFin:form.fechaFin, fechaRetorno:fechaRetornoCalc,
         observaciones:form.observaciones, diasEstimados:calcResult.dias,
         feriadosEnRango:calcResult.feriadosEnRango, cumpleEnRango:calcResult.cumpleEnRango,
         periodosDesglose:form.tipo==="VACACION"?desglosePeriodos:[],
@@ -697,7 +716,7 @@ function SolicitarView({miEmpleado, sols, recargar}){
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
               <div><label style={LBL}>Fecha inicio *</label><input type="date" style={INP} value={form.fechaInicio} onChange={e=>set("fechaInicio",e.target.value)}/></div>
               <div><label style={LBL}>Fecha fin *</label><input type="date" style={INP} value={form.fechaFin} min={form.fechaInicio} onChange={e=>set("fechaFin",e.target.value)}/></div>
-              <div><label style={LBL}>Fecha retorno (opcional)</label><input type="date" style={INP} value={form.fechaRetorno} onChange={e=>set("fechaRetorno",e.target.value)}/></div>
+              <div><label style={LBL}>Fecha retorno <span style={{color:"#9ca3af",fontWeight:"400"}}>(automática)</span></label><div style={{...INP,backgroundColor:"#f9fafb",color:fechaRetornoCalc?COLOR_RED:"#9ca3af",fontWeight:"600"}}>{fechaRetornoCalc?fmtD(fechaRetornoCalc):"—"}</div></div>
               <div><label style={LBL}>Días hábiles estimados</label><div style={{...INP,backgroundColor:"#f9fafb",color:diasCalc>0?COLOR_RED:"#9ca3af",fontWeight:"600"}}>{diasCalc>0?`${diasCalc} día(s)`:"—"}</div></div>
             </div>
             {(fers.length>0||cumple)&&(
@@ -778,9 +797,10 @@ function MisSolicitudesView({miEmpleado, sols, recargar}){
     try{
       const calc=calcDias(editForm.fechaInicio,editForm.fechaFin,editForm.modalidad,editForm.horasPorDia,feriadosVar,miEmpleado.fechaNacimiento||null,miEmpleado.horarioSemana||"L-V");
       const desglose=(editForm.tipo==="VACACION"&&calc.dias>0)?calcDesglosePeriodos(miEmpleado,sols,calc.dias,hoyISO()):[];
+      const retorno=calcFechaRetorno(editForm.fechaFin,miEmpleado.horarioSemana||"L-V",feriadosVar);
       await DB.solUpdate(sel.id,{
         tipo:editForm.tipo,modalidad:editForm.modalidad,horasPorDia:editForm.horasPorDia,
-        fechaInicio:editForm.fechaInicio,fechaFin:editForm.fechaFin,fechaRetorno:editForm.fechaRetorno,
+        fechaInicio:editForm.fechaInicio,fechaFin:editForm.fechaFin,fechaRetorno:retorno,
         observaciones:editForm.observaciones,diasEstimados:calc.dias,feriadosEnRango:calc.feriadosEnRango,
         cumpleEnRango:calc.cumpleEnRango,periodosDesglose:desglose,
       });
@@ -822,8 +842,8 @@ function MisSolicitudesView({miEmpleado, sols, recargar}){
               <div><label style={LBL}>Fecha inicio</label><input type="date" style={INP} value={editForm.fechaInicio} onChange={e=>setEditForm(p=>({...p,fechaInicio:e.target.value}))}/></div>
               <div><label style={LBL}>Fecha fin</label><input type="date" style={INP} value={editForm.fechaFin} min={editForm.fechaInicio} onChange={e=>setEditForm(p=>({...p,fechaFin:e.target.value}))}/></div>
             </div>
-            <div><label style={LBL}>Fecha retorno (opcional)</label><input type="date" style={INP} value={editForm.fechaRetorno} onChange={e=>setEditForm(p=>({...p,fechaRetorno:e.target.value}))}/></div>
             <div><label style={LBL}>Observaciones</label><textarea style={{...INP,minHeight:"60px",resize:"vertical"}} value={editForm.observaciones} onChange={e=>setEditForm(p=>({...p,observaciones:e.target.value}))}/></div>
+            <p style={{fontSize:"11px",color:"#9ca3af",margin:0}}>La fecha de retorno se recalcula automáticamente según el horario del empleado.</p>
             <button onClick={guardarEdicion} disabled={savingEdit} style={{...BTN_PRIMARY,opacity:savingEdit?0.6:1}}>{savingEdit?"Guardando...":"💾 Guardar cambios"}</button>
           </div>
         </div>
@@ -1311,12 +1331,13 @@ function RRHHSolicitudes({sols, emps, recargar}){
       const emp=(emps||[]).find(e=>e.ci===sel.ci);
       const calc=calcDias(editForm.fechaInicio,editForm.fechaFin,editForm.modalidad,editForm.horasPorDia,feriadosVar,emp?.fechaNacimiento||null,emp?.horarioSemana||"L-V");
       const desglose=(emp&&editForm.tipo==="VACACION"&&calc.dias>0)?calcDesglosePeriodos(emp,sols.filter(s=>s.id!==sel.id),calc.dias,hoyISO()):[];
+      const retorno=calcFechaRetorno(editForm.fechaFin,emp?.horarioSemana||"L-V",feriadosVar);
       const notaCambio=motivoCambio.trim()
         ?`\n[Corregido por RRHH el ${fmtD(hoyISO())}: ${motivoCambio.trim()}]`
         :`\n[Corregido por RRHH el ${fmtD(hoyISO())}]`;
       await DB.solUpdate(sel.id,{
         tipo:editForm.tipo,modalidad:editForm.modalidad,horasPorDia:editForm.horasPorDia,
-        fechaInicio:editForm.fechaInicio,fechaFin:editForm.fechaFin,fechaRetorno:editForm.fechaRetorno,
+        fechaInicio:editForm.fechaInicio,fechaFin:editForm.fechaFin,fechaRetorno:retorno,
         observaciones:(editForm.observaciones||"")+notaCambio,
         diasEstimados:calc.dias,feriadosEnRango:calc.feriadosEnRango,cumpleEnRango:calc.cumpleEnRango,
         periodosDesglose:desglose,vistoEmpleado:false,
@@ -1462,11 +1483,18 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
   const [error,setError]=useState("");
   const [msg,setMsg]=useState("");
   const [saving,setSaving]=useState(false);
+  const [feriadosVar,setFeriadosVar]=useState([]);
+
+  useEffect(()=>{
+    const yr=new Date().getFullYear();
+    Promise.all([DB.ferGet(yr),DB.ferGet(yr+1),DB.ferGet(yr-1)]).then(([a,b,c])=>setFeriadosVar([...a,...b,...c]));
+  },[]);
 
   const emp=emps.find(e=>e.id===empId);
   const saldoActual=emp?calcSaldoActual(emp,sols):0;
-  const diasCalc=(emp&&fechaInicio&&fechaFin)?calcDias(fechaInicio,fechaFin,modalidad,horasPorDia,[],emp.fechaNacimiento||null,emp.horarioSemana||"L-V"):{dias:0,feriadosEnRango:[],cumpleEnRango:null};
+  const diasCalc=(emp&&fechaInicio&&fechaFin)?calcDias(fechaInicio,fechaFin,modalidad,horasPorDia,feriadosVar,emp.fechaNacimiento||null,emp.horarioSemana||"L-V"):{dias:0,feriadosEnRango:[],cumpleEnRango:null};
   const desglosePeriodos=(emp&&tipo==="VACACION"&&fechaInicio&&diasCalc.dias>0)?calcDesglosePeriodos(emp,sols,diasCalc.dias,fechaInicio):[];
+  const fechaRetornoCalc=(emp&&fechaFin)?calcFechaRetorno(fechaFin,emp.horarioSemana||"L-V",feriadosVar):"";
 
   const registrar=async()=>{
     setError(""); setMsg("");
@@ -1484,7 +1512,7 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
         cargo:emp.cargo, area:emp.area, sucursal:emp.sucursal||"", fechaIngreso:emp.fechaIngreso||"",
         codigo:emp.codigo||"", diasDisponibles:String(saldoActual),
         tipo, modalidad, horasPorDia,
-        fechaInicio, fechaFin, fechaRetorno:"",
+        fechaInicio, fechaFin, fechaRetorno:fechaRetornoCalc,
         observaciones:observaciones||"Registrada por RRHH (vacación ya tomada).",
         diasEstimados:diasCalc.dias, feriadosEnRango:diasCalc.feriadosEnRango, cumpleEnRango:diasCalc.cumpleEnRango,
         periodosDesglose:tipo==="VACACION"?desglosePeriodos:[],
@@ -1540,7 +1568,7 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
           <div><label style={LBL}>Fecha inicio *</label><input type="date" style={INP} value={fechaInicio} onChange={e=>setFechaInicio(e.target.value)}/></div>
           <div><label style={LBL}>Fecha fin *</label><input type="date" style={INP} value={fechaFin} min={fechaInicio} onChange={e=>setFechaFin(e.target.value)}/></div>
         </div>
-        {emp&&fechaInicio&&fechaFin&&<div style={{padding:"8px 12px",backgroundColor:"#f9fafb",borderRadius:"8px",fontSize:"13px"}}>Días {modalidad==="HORA"?"(equivalentes)":"hábiles"}: <strong>{diasCalc.dias}</strong></div>}
+        {emp&&fechaInicio&&fechaFin&&<div style={{padding:"8px 12px",backgroundColor:"#f9fafb",borderRadius:"8px",fontSize:"13px"}}>Días {modalidad==="HORA"?"(equivalentes)":"hábiles"}: <strong>{diasCalc.dias}</strong>{fechaRetornoCalc&&<> · Retorno: <strong>{fmtD(fechaRetornoCalc)}</strong></>}</div>}
         {tipo==="VACACION"&&desglosePeriodos.length>0&&(
           <div style={{padding:"8px 12px",backgroundColor:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:"8px",fontSize:"12px",color:"#374151"}}>
             <strong>📅 Se descontará de la(s) gestión(es):</strong> {desglosePeriodos.map(p=>`${p.label} (${p.dias} día${p.dias!==1?"s":""})`).join(", ")}
@@ -1581,6 +1609,8 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
   const saldoActual=useMemo(()=>emp?calcSaldoActual(emp,sols):0,[emp,sols]);
   const desglosePeriodos=useMemo(()=>(emp&&form.tipo==="VACACION"&&calcResult.dias>0)?calcDesglosePeriodos(emp,sols,calcResult.dias,hoyISO()):[],
     [emp,sols,form.tipo,calcResult.dias]);
+  const fechaRetornoCalc=useMemo(()=>emp?calcFechaRetorno(form.fechaFin,emp.horarioSemana||"L-V",feriadosVar):"",
+    [emp,form.fechaFin,feriadosVar]);
 
   const validar=()=>{
     if(!emp) return "Selecciona un empleado.";
@@ -1605,7 +1635,7 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
         cargo:emp.cargo, area:emp.area, sucursal:emp.sucursal||"", fechaIngreso:emp.fechaIngreso||"",
         codigo:emp.codigo||"", diasDisponibles:String(saldoActual),
         tipo:form.tipo, modalidad:form.modalidad, horasPorDia:form.horasPorDia,
-        fechaInicio:form.fechaInicio, fechaFin:form.fechaFin, fechaRetorno:form.fechaRetorno,
+        fechaInicio:form.fechaInicio, fechaFin:form.fechaFin, fechaRetorno:fechaRetornoCalc,
         observaciones:form.observaciones, diasEstimados:calcResult.dias,
         feriadosEnRango:calcResult.feriadosEnRango, cumpleEnRango:calcResult.cumpleEnRango,
         periodosDesglose:form.tipo==="VACACION"?desglosePeriodos:[],
@@ -1673,7 +1703,7 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
               <div><label style={LBL}>Fecha inicio *</label><input type="date" style={INP} value={form.fechaInicio} onChange={e=>set("fechaInicio",e.target.value)}/></div>
               <div><label style={LBL}>Fecha fin *</label><input type="date" style={INP} value={form.fechaFin} min={form.fechaInicio} onChange={e=>set("fechaFin",e.target.value)}/></div>
-              <div><label style={LBL}>Fecha retorno (opcional)</label><input type="date" style={INP} value={form.fechaRetorno} onChange={e=>set("fechaRetorno",e.target.value)}/></div>
+              <div><label style={LBL}>Fecha retorno <span style={{color:"#9ca3af",fontWeight:"400"}}>(automática)</span></label><div style={{...INP,backgroundColor:"#f9fafb",color:fechaRetornoCalc?COLOR_RED:"#9ca3af",fontWeight:"600"}}>{fechaRetornoCalc?fmtD(fechaRetornoCalc):"—"}</div></div>
               <div><label style={LBL}>Días hábiles estimados</label><div style={{...INP,backgroundColor:"#f9fafb",color:diasCalc>0?COLOR_RED:"#9ca3af",fontWeight:"600"}}>{diasCalc>0?`${diasCalc} día(s)`:"—"}</div></div>
             </div>
             {(fers.length>0||cumple)&&(
