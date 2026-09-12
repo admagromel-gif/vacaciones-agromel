@@ -124,6 +124,15 @@ function calcFechaRetorno(fechaFin, horarioSemana="L-V", feriadosVar=[]){
   return cur.toISOString().split("T")[0];
 }
 
+// Busca si el empleado ya tiene otra solicitud (Pendiente o Aprobada) cuyas fechas se crucen con las nuevas.
+function buscarCruce(sols, ci, fechaInicio, fechaFin, excluirId){
+  if(!ci||!fechaInicio||!fechaFin) return null;
+  return (sols||[]).find(s=>
+    s.ci===ci && s.id!==excluirId && (s.estado==="Pendiente"||s.estado==="Aprobada") &&
+    s.fechaInicio && s.fechaFin && fechaInicio<=s.fechaFin && fechaFin>=s.fechaInicio
+  )||null;
+}
+
 function calcDias(ini, fin, mod, hpd, feriadosVar=[], fechaNac=null, horarioSemana="L-V") {
   if(!ini||!fin) return {dias:0,feriadosEnRango:[],cumpleEnRango:null};
   let count=0;
@@ -438,13 +447,13 @@ function PrintForm({s}) {
           <span style={{border,backgroundColor:"white",padding:"3px 12px",fontWeight:"bold"}}>{diasDisp!==null?fmtNum(diasDisp):""}</span>
         </div>
       </div>
-      <table style={{width:"100%",borderCollapse:"collapse",marginBottom:"12px"}}><tbody>
+      <table style={{width:"100%",borderCollapse:"collapse",marginBottom:"12px",tableLayout:"fixed"}}><tbody>
         <tr>
-          <td style={th2}>Periodo</td><td style={th2}>Fecha de Inicio</td><td style={th2}>Fecha de Término</td>
+          <td style={{...th2,width:"17%",whiteSpace:"nowrap"}}>Periodo</td><td style={th2}>Fecha de Inicio</td><td style={th2}>Fecha de Término</td>
           <td style={th2}>Total Dias Laborales</td><td style={th2}>Fecha de Retorno</td><td style={th2}>Días Pendientes</td>
         </tr>
         <tr>
-          <td style={td2}>{s.periodosDesglose&&s.periodosDesglose.length?s.periodosDesglose.map((p,i)=>(
+          <td style={{...td2,whiteSpace:"nowrap"}}>{s.periodosDesglose&&s.periodosDesglose.length?s.periodosDesglose.map((p,i)=>(
             <div key={i} style={{lineHeight:"1.4"}}>{p.label}</div>
           )):(s.fechaInicio?s.fechaInicio.slice(0,4):"")}</td>
           <td style={td2}>{fmtD(s.fechaInicio)}</td>
@@ -637,6 +646,8 @@ function SolicitarView({miEmpleado, sols, recargar}){
     [miEmpleado,sols,form.tipo,calcResult.dias]);
   const fechaRetornoCalc=useMemo(()=>calcFechaRetorno(form.fechaFin,miEmpleado.horarioSemana||"L-V",feriadosVar),
     [form.fechaFin,miEmpleado.horarioSemana,feriadosVar]);
+  const cruce=useMemo(()=>buscarCruce(sols,miEmpleado.ci,form.fechaInicio,form.fechaFin),
+    [sols,miEmpleado.ci,form.fechaInicio,form.fechaFin]);
 
   const validar=()=>{
     if(!form.fechaInicio) return "Selecciona la fecha de inicio.";
@@ -728,6 +739,11 @@ function SolicitarView({miEmpleado, sols, recargar}){
             {form.tipo==="VACACION"&&diasCalc>saldoActual&&(
               <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",fontSize:"12px",color:"#dc2626"}}>
                 ⚠️ Estás solicitando {diasCalc} día(s), pero tu saldo disponible es de {saldoActual} día(s). Igual puedes enviarla, pero tu jefe verá esta misma advertencia al revisarla.
+              </div>
+            )}
+            {cruce&&(
+              <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#fff7ed",border:"1px solid #fed7aa",borderRadius:"8px",fontSize:"12px",color:"#9a3412"}}>
+                ⚠️ Estas fechas se cruzan con otra solicitud tuya (N° {cruce.numero}, {fmtD(cruce.fechaInicio)} → {fmtD(cruce.fechaFin)}, {cruce.estado}).
               </div>
             )}
             {form.tipo==="VACACION"&&desglosePeriodos.length>0&&(
@@ -1028,6 +1044,10 @@ function RRHHEmpleados({emps, sols, recargar}){
 
   const guardar=async()=>{
     if(!form.nombre.trim()){setMsg("⚠️ El nombre es obligatorio.");return;}
+    if(form.ci&&form.ci.trim()){
+      const dup=emps.find(e=>e.ci===form.ci.trim()&&e.id!==form.id);
+      if(dup){setMsg(`⚠️ Ya existe un empleado con ese CI: ${dup.nombre}. Revisa antes de guardar.`);return;}
+    }
     if(saving) return;
     setSaving(true); setMsg("");
     try{
@@ -1342,6 +1362,12 @@ function RRHHSolicitudes({sols, emps, recargar}){
         diasEstimados:calc.dias,feriadosEnRango:calc.feriadosEnRango,cumpleEnRango:calc.cumpleEnRango,
         periodosDesglose:desglose,vistoEmpleado:false,
       });
+      const miUid=window.__fbAuth.currentUser?.uid||"";
+      const yo=(emps||[]).find(e=>e.uid===miUid);
+      DB.auditLog({tipo:"corregida",solicitudId:sel.id,numero:sel.numero,empleadoCi:sel.ci,nombreEmpleado:sel.nombreEmpleado,
+        dias:calc.dias,porUid:miUid,porNombre:yo?.nombre||"RRHH",
+        detalle:motivoCambio.trim()||"Corrección de fechas por RRHH",
+        copiaSolicitud:{...sel,fechaInicioAnterior:sel.fechaInicio,fechaFinAnterior:sel.fechaFin,diasAnterior:sel.diasEstimados}});
       setEditando(false); setSel(null);
       recargar();
     }catch(e){ setErrorEdit("No se pudo guardar. Intenta de nuevo."); }
@@ -1495,6 +1521,7 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
   const diasCalc=(emp&&fechaInicio&&fechaFin)?calcDias(fechaInicio,fechaFin,modalidad,horasPorDia,feriadosVar,emp.fechaNacimiento||null,emp.horarioSemana||"L-V"):{dias:0,feriadosEnRango:[],cumpleEnRango:null};
   const desglosePeriodos=(emp&&tipo==="VACACION"&&fechaInicio&&diasCalc.dias>0)?calcDesglosePeriodos(emp,sols,diasCalc.dias,fechaInicio):[];
   const fechaRetornoCalc=(emp&&fechaFin)?calcFechaRetorno(fechaFin,emp.horarioSemana||"L-V",feriadosVar):"";
+  const cruce=emp?buscarCruce(sols,emp.ci,fechaInicio,fechaFin):null;
 
   const registrar=async()=>{
     setError(""); setMsg("");
@@ -1531,8 +1558,8 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
 
   return(
     <div style={{maxWidth:"560px"}}>
-      <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"6px"}}>Registrar vacación ya tomada</div>
-      <p style={{fontSize:"12px",color:"#9ca3af",marginBottom:"16px"}}>Úsalo para empleados que ya pidieron y tomaron sus vacaciones fuera del sistema — queda registrada como Aprobada de inmediato y descuenta su saldo.</p>
+      <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"6px"}}>Registrar o programar vacación</div>
+      <p style={{fontSize:"12px",color:"#9ca3af",marginBottom:"16px"}}>Úsalo tanto para vacaciones que ya se tomaron fuera del sistema (fechas pasadas) como para programar vacaciones futuras que ya están confirmadas de antemano (fechas a futuro). En ambos casos queda como Aprobada de inmediato y descuenta el saldo, sin pasar por el jefe.</p>
       {msg&&<div style={{padding:"10px 14px",backgroundColor:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:"8px",color:"#166534",fontSize:"13px",marginBottom:"12px"}}>{msg}</div>}
       {error&&<div style={{padding:"10px 14px",backgroundColor:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",color:"#dc2626",fontSize:"13px",marginBottom:"12px"}}>⚠️ {error}</div>}
       <div style={{display:"flex",flexDirection:"column",gap:"12px"}}>
@@ -1569,6 +1596,7 @@ function RRHHRegistrarVacacion({emps, sols, recargar}){
           <div><label style={LBL}>Fecha fin *</label><input type="date" style={INP} value={fechaFin} min={fechaInicio} onChange={e=>setFechaFin(e.target.value)}/></div>
         </div>
         {emp&&fechaInicio&&fechaFin&&<div style={{padding:"8px 12px",backgroundColor:"#f9fafb",borderRadius:"8px",fontSize:"13px"}}>Días {modalidad==="HORA"?"(equivalentes)":"hábiles"}: <strong>{diasCalc.dias}</strong>{fechaRetornoCalc&&<> · Retorno: <strong>{fmtD(fechaRetornoCalc)}</strong></>}</div>}
+        {cruce&&<div style={{padding:"8px 12px",backgroundColor:"#fff7ed",border:"1px solid #fed7aa",borderRadius:"8px",fontSize:"12px",color:"#9a3412"}}>⚠️ Se cruza con otra solicitud de {emp.nombre} (N° {cruce.numero}, {fmtD(cruce.fechaInicio)} → {fmtD(cruce.fechaFin)}, {cruce.estado}).</div>}
         {tipo==="VACACION"&&desglosePeriodos.length>0&&(
           <div style={{padding:"8px 12px",backgroundColor:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:"8px",fontSize:"12px",color:"#374151"}}>
             <strong>📅 Se descontará de la(s) gestión(es):</strong> {desglosePeriodos.map(p=>`${p.label} (${p.dias} día${p.dias!==1?"s":""})`).join(", ")}
@@ -1611,6 +1639,8 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
     [emp,sols,form.tipo,calcResult.dias]);
   const fechaRetornoCalc=useMemo(()=>emp?calcFechaRetorno(form.fechaFin,emp.horarioSemana||"L-V",feriadosVar):"",
     [emp,form.fechaFin,feriadosVar]);
+  const cruce=useMemo(()=>emp?buscarCruce(sols,emp.ci,form.fechaInicio,form.fechaFin):null,
+    [emp,sols,form.fechaInicio,form.fechaFin]);
 
   const validar=()=>{
     if(!emp) return "Selecciona un empleado.";
@@ -1717,6 +1747,11 @@ function RRHHSolicitarPorEmpleado({emps, sols, recargar}){
                 ⚠️ Se están solicitando {diasCalc} día(s), pero el saldo disponible es de {saldoActual} día(s).
               </div>
             )}
+            {cruce&&(
+              <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#fff7ed",border:"1px solid #fed7aa",borderRadius:"8px",fontSize:"12px",color:"#9a3412"}}>
+                ⚠️ Se cruza con otra solicitud de {emp.nombre} (N° {cruce.numero}, {fmtD(cruce.fechaInicio)} → {fmtD(cruce.fechaFin)}, {cruce.estado}).
+              </div>
+            )}
             {form.tipo==="VACACION"&&desglosePeriodos.length>0&&(
               <div style={{marginTop:"10px",padding:"8px 12px",backgroundColor:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:"8px",fontSize:"12px",color:"#374151"}}>
                 <strong>📅 Se descontará de la(s) gestión(es):</strong> {desglosePeriodos.map(p=>`${p.label} (${p.dias} día${p.dias!==1?"s":""})`).join(", ")}
@@ -1767,7 +1802,7 @@ function RRHHAuditoria(){
     <div>
       <button onClick={()=>setSel(null)} style={{marginBottom:"12px",color:COLOR_RED,background:"none",border:"none",cursor:"pointer"}}>← Lista</button>
       <div style={{...CARD,padding:"20px 24px"}}>
-        <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"12px"}}>{sel.tipo==="eliminada"?"🗑️ Eliminación":"➕ Creación"} — N° {sel.numero}</div>
+        <div style={{fontSize:"16px",fontWeight:"700",marginBottom:"12px"}}>{sel.tipo==="eliminada"?"🗑️ Eliminación":sel.tipo==="corregida"?"✏️ Corrección":"➕ Creación"} — N° {sel.numero}</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",fontSize:"13px",marginBottom:"14px"}}>
           {[["Empleado",sel.nombreEmpleado],["CI",sel.empleadoCi],["Días",sel.dias],["Hecho por",sel.porNombre],["Fecha del registro",fmtD(sel.fecha?.split("T")[0])],["Detalle",sel.detalle]].map(([k,v])=>(
             <div key={k}><div style={{color:"#9ca3af",fontSize:"11px"}}>{k}</div><div style={{fontWeight:"600"}}>{v||"—"}</div></div>
@@ -1796,12 +1831,192 @@ function RRHHAuditoria(){
         {filtrados.map(r=>(
           <div key={r.id} onClick={()=>setSel(r)} style={{...CARD,padding:"12px 16px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div>
-              <div style={{fontWeight:"600",fontSize:"13px"}}>{r.tipo==="eliminada"?"🗑️":"➕"} N° {r.numero} — {r.nombreEmpleado}</div>
+              <div style={{fontWeight:"600",fontSize:"13px"}}>{r.tipo==="eliminada"?"🗑️":r.tipo==="corregida"?"✏️":"➕"} N° {r.numero} — {r.nombreEmpleado}</div>
               <div style={{color:"#9ca3af",fontSize:"12px",marginTop:"2px"}}>{r.detalle} · por {r.porNombre} · {fmtD(r.fecha?.split("T")[0])}</div>
             </div>
           </div>
         ))}
       </div>}
+    </div>
+  );
+}
+
+// ============================================================
+// PANEL RRHH — SALDOS (ver y descargar)
+// ============================================================
+function RRHHSaldos({emps, sols}){
+  const [busqueda,setBusqueda]=useState("");
+  const [orden,setOrden]=useState("saldo");
+  const [ordenDesc,setOrdenDesc]=useState(true);
+
+  const b=busqueda.trim().toLowerCase();
+  const filas=emps.filter(e=>!e.cuentaAdmin)
+    .map(e=>({...e,saldo:calcSaldoActual(e,sols),antig:calcAntiguedadTxt(e.fechaIngreso)}))
+    .filter(e=>!b||[e.nombre,e.ci,e.cargo,e.area,e.sucursal].filter(Boolean).some(v=>String(v).toLowerCase().includes(b)))
+    .sort((a,b2)=>{
+      let va,vb;
+      if(orden==="saldo"){va=a.saldo;vb=b2.saldo;}
+      else{va=(a[orden]||"").toString().toLowerCase();vb=(b2[orden]||"").toString().toLowerCase();}
+      const cmp=va<vb?-1:va>vb?1:0;
+      return ordenDesc?-cmp:cmp;
+    });
+
+  const totalSaldo=filas.reduce((s,e)=>s+(parseFloat(e.saldo)||0),0);
+
+  const exportarCSV=()=>{
+    const esc=v=>{
+      const s=(v===undefined||v===null)?"":String(v);
+      return s.includes(",")||s.includes('"')||s.includes("\n") ? `"${s.replace(/"/g,'""')}"` : s;
+    };
+    const filasCSV=[["Nombre","CI","Cargo","Area","Sucursal","FechaIngreso","Antiguedad","SaldoActual"]];
+    filas.forEach(e=>filasCSV.push([e.nombre,e.ci,e.cargo,e.area,e.sucursal,e.fechaIngreso,e.antig,e.saldo]));
+    const csv=filasCSV.map(f=>f.map(esc).join(",")).join("\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url; a.download=`saldos_agromel_${hoyISO()}.csv`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px",flexWrap:"wrap",gap:"8px"}}>
+        <div>
+          <div style={{fontSize:"16px",fontWeight:"700"}}>Saldos de vacaciones</div>
+          <div style={{fontSize:"12px",color:"#9ca3af"}}>{filas.length} empleado(s) · Suma total: {Math.round(totalSaldo*10)/10} día(s)</div>
+        </div>
+        <button onClick={exportarCSV} style={BTN_SECONDARY}>💾 Exportar CSV</button>
+      </div>
+      <input value={busqueda} onChange={e=>setBusqueda(e.target.value)} placeholder="🔍 Buscar por nombre, CI, cargo, área o sucursal..." style={{...INP,marginBottom:"10px"}}/>
+      <div style={{display:"flex",gap:"8px",flexWrap:"wrap",marginBottom:"14px",alignItems:"center"}}>
+        <span style={{fontSize:"12px",color:"#9ca3af"}}>Ordenar por:</span>
+        <select value={orden} onChange={e=>setOrden(e.target.value)} style={{...INP,width:"auto",fontSize:"13px",padding:"7px 10px"}}>
+          <option value="saldo">Saldo</option>
+          <option value="nombre">Nombre</option>
+          <option value="area">Área</option>
+          <option value="sucursal">Sucursal</option>
+          <option value="fechaIngreso">Fecha de ingreso</option>
+        </select>
+        <button onClick={()=>setOrdenDesc(d=>!d)} style={{...BTN_SECONDARY,padding:"7px 12px",fontSize:"13px"}}>{ordenDesc?"↓ Descendente":"↑ Ascendente"}</button>
+      </div>
+      {filas.length===0?<div style={{textAlign:"center",padding:"40px",color:"#9ca3af"}}>No hay empleados.</div>:
+      <div style={{display:"flex",flexDirection:"column",gap:"6px"}}>
+        {filas.map(e=>(
+          <div key={e.id} style={{...CARD,padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div>
+              <div style={{fontWeight:"600",fontSize:"14px"}}>{e.nombre}</div>
+              <div style={{fontSize:"12px",color:"#9ca3af",marginTop:"2px"}}>{[e.cargo,e.area,e.sucursal,e.antig&&`Antigüedad: ${e.antig}`].filter(Boolean).join(" · ")}</div>
+            </div>
+            <div style={{fontWeight:"700",fontSize:"16px",color:e.saldo<0?"#dc2626":COLOR_RED}}>{e.saldo} día(s)</div>
+          </div>
+        ))}
+      </div>}
+    </div>
+  );
+}
+
+// ============================================================
+// PANEL RRHH — CALENDARIO DE VACACIONES
+// ============================================================
+const MESES_NOMBRE=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
+const DIAS_SEMANA=["Dom","Lun","Mar","Mié","Jue","Vie","Sáb"];
+
+function RRHHCalendario({emps, sols}){
+  const hoy=new Date();
+  const [anio,setAnio]=useState(hoy.getFullYear());
+  const [mes,setMes]=useState(hoy.getMonth());
+  const [empFiltro,setEmpFiltro]=useState("");
+
+  const primerDia=new Date(anio,mes,1);
+  const diasEnMes=new Date(anio,mes+1,0).getDate();
+  const primerDow=primerDia.getDay();
+  const pad=n=>String(n).padStart(2,"0");
+  const inicioMes=`${anio}-${pad(mes+1)}-01`;
+  const finMes=`${anio}-${pad(mes+1)}-${pad(diasEnMes)}`;
+
+  const eventos=(sols||[])
+    .filter(s=>(s.estado==="Aprobada"||s.estado==="Pendiente")&&s.fechaInicio&&s.fechaFin)
+    .filter(s=>!empFiltro||s.ci===empFiltro)
+    .filter(s=>s.fechaInicio<=finMes&&s.fechaFin>=inicioMes);
+
+  const eventosPorDia={};
+  eventos.forEach(s=>{
+    for(let d=1;d<=diasEnMes;d++){
+      const ds=`${anio}-${pad(mes+1)}-${pad(d)}`;
+      if(ds>=s.fechaInicio&&ds<=s.fechaFin){
+        (eventosPorDia[d]=eventosPorDia[d]||[]).push(s);
+      }
+    }
+  });
+
+  const celdas=[];
+  for(let i=0;i<primerDow;i++) celdas.push(null);
+  for(let d=1;d<=diasEnMes;d++) celdas.push(d);
+
+  const cambiarMes=delta=>{
+    let m=mes+delta, a=anio;
+    if(m<0){m=11;a--;} if(m>11){m=0;a++;}
+    setMes(m); setAnio(a);
+  };
+
+  const exportarCSV=()=>{
+    const esc=v=>{
+      const s=(v===undefined||v===null)?"":String(v);
+      return s.includes(",")||s.includes('"')||s.includes("\n") ? `"${s.replace(/"/g,'""')}"` : s;
+    };
+    const filas=[["Empleado","CI","Cargo","Tipo","FechaInicio","FechaFin","Dias","Estado"]];
+    eventos.forEach(s=>filas.push([s.nombreEmpleado,s.ci,s.cargo,s.tipo,s.fechaInicio,s.fechaFin,s.diasEstimados,s.estado]));
+    const csv=filas.map(f=>f.map(esc).join(",")).join("\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url; a.download=`calendario_vacaciones_${MESES_NOMBRE[mes]}_${anio}.csv`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return(
+    <div>
+      <div className="print-hidden" style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px",flexWrap:"wrap",gap:"10px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+          <button onClick={()=>cambiarMes(-1)} style={{padding:"6px 12px",borderRadius:"6px",border:"1.5px solid #e5e7eb",backgroundColor:"white",cursor:"pointer"}}>‹</button>
+          <span style={{fontWeight:"700",fontSize:"16px",minWidth:"160px",textAlign:"center"}}>{MESES_NOMBRE[mes]} {anio}</span>
+          <button onClick={()=>cambiarMes(1)} style={{padding:"6px 12px",borderRadius:"6px",border:"1.5px solid #e5e7eb",backgroundColor:"white",cursor:"pointer"}}>›</button>
+        </div>
+        <div style={{display:"flex",gap:"8px",flexWrap:"wrap"}}>
+          <select value={empFiltro} onChange={e=>setEmpFiltro(e.target.value)} style={{...INP,width:"auto",fontSize:"13px",padding:"7px 10px"}}>
+            <option value="">Todos los empleados</option>
+            {emps.filter(e=>!e.cuentaAdmin).sort((a,b)=>a.nombre.localeCompare(b.nombre)).map(e=><option key={e.id} value={e.ci}>{e.nombre}</option>)}
+          </select>
+          <button onClick={()=>window.print()} style={BTN_SECONDARY}>🖨️ Imprimir</button>
+          <button onClick={exportarCSV} style={BTN_SECONDARY}>💾 Exportar CSV</button>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:"14px",marginBottom:"10px",fontSize:"12px"}}>
+        <span><span style={{display:"inline-block",width:"10px",height:"10px",borderRadius:"3px",backgroundColor:"#16a34a",marginRight:"4px"}}/>Aprobada</span>
+        <span><span style={{display:"inline-block",width:"10px",height:"10px",borderRadius:"3px",backgroundColor:"#ca8a04",marginRight:"4px"}}/>Pendiente</span>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:"4px",marginBottom:"4px"}}>
+        {DIAS_SEMANA.map(d=><div key={d} style={{textAlign:"center",fontSize:"11px",fontWeight:"700",color:"#6b7280",padding:"4px"}}>{d}</div>)}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:"4px"}}>
+        {celdas.map((d,i)=>{
+          const evs=d?(eventosPorDia[d]||[]):[];
+          const esHoy=d&&anio===hoy.getFullYear()&&mes===hoy.getMonth()&&d===hoy.getDate();
+          return(
+            <div key={i} style={{minHeight:"70px",border:"1px solid #e5e7eb",borderRadius:"6px",padding:"4px",backgroundColor:d?"white":"#f9fafb",...(esHoy?{borderColor:COLOR_RED,borderWidth:"2px"}:{})}}>
+              {d&&<div style={{fontSize:"11px",fontWeight:esHoy?"700":"600",color:esHoy?COLOR_RED:"#374151",marginBottom:"3px"}}>{d}</div>}
+              {evs.slice(0,3).map((s,idx)=>(
+                <div key={idx} title={`${s.nombreEmpleado} (${s.estado})`} style={{fontSize:"9px",backgroundColor:s.estado==="Aprobada"?"#f0fdf4":"#fef9c3",color:s.estado==="Aprobada"?"#166534":"#854d0e",borderRadius:"3px",padding:"1px 4px",marginBottom:"2px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                  {s.nombreEmpleado.split(" ")[0]}
+                </div>
+              ))}
+              {evs.length>3&&<div style={{fontSize:"9px",color:"#9ca3af"}}>+{evs.length-3} más</div>}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -1962,7 +2177,7 @@ function AppMain(){
   const TABS=[
     ...(esCuentaAdmin?[]:[{id:"solicitar",label:"🏖️ Solicitar"},{id:"mis_sol",label:"📄 Mis Solicitudes",badge:misSinVer}]),
     ...(!esCuentaAdmin&&tieneEquipo?[{id:"aprobaciones",label:"✅ Aprobaciones",badge:pendAprobar}]:[]),
-    ...(miEmpleado.esRRHH?[{id:"rrhh_emp",label:"👥 Empleados"},{id:"rrhh_sol_por_emp",label:"📝 Solicitar por Empleado"},{id:"rrhh_reg",label:"➕ Registrar Vacación"},{id:"rrhh_sol",label:"📋 Solicitudes",badge:pendRRHH},{id:"rrhh_fer",label:"🏳️ Feriados"},{id:"rrhh_audit",label:"🗄️ Auditoría"}]:[]),
+    ...(miEmpleado.esRRHH?[{id:"rrhh_emp",label:"👥 Empleados"},{id:"rrhh_sol_por_emp",label:"📝 Solicitar por Empleado"},{id:"rrhh_reg",label:"➕ Registrar/Programar Vacación"},{id:"rrhh_sol",label:"📋 Solicitudes",badge:pendRRHH},{id:"rrhh_saldos",label:"💰 Saldos"},{id:"rrhh_cal",label:"📅 Calendario"},{id:"rrhh_fer",label:"🏳️ Feriados"},{id:"rrhh_audit",label:"🗄️ Auditoría"}]:[]),
   ];
 
   return(
@@ -1992,6 +2207,8 @@ function AppMain(){
         {view==="rrhh_sol_por_emp"&&miEmpleado.esRRHH&&<RRHHSolicitarPorEmpleado emps={emps} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_reg"&&miEmpleado.esRRHH&&<RRHHRegistrarVacacion emps={emps} sols={sols} recargar={recargarTodo}/>}
         {view==="rrhh_sol"&&miEmpleado.esRRHH&&<RRHHSolicitudes sols={sols} emps={emps} recargar={recargarTodo}/>}
+        {view==="rrhh_saldos"&&miEmpleado.esRRHH&&<RRHHSaldos emps={emps} sols={sols}/>}
+        {view==="rrhh_cal"&&miEmpleado.esRRHH&&<RRHHCalendario emps={emps} sols={sols}/>}
         {view==="rrhh_fer"&&miEmpleado.esRRHH&&<RRHHFeriados/>}
         {view==="rrhh_audit"&&miEmpleado.esRRHH&&<RRHHAuditoria/>}
       </div>
